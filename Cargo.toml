@@ -1,0 +1,35 @@
+[lib]
+crate-type = ["staticlib"]
+
+[package]
+name = "kernel"
+version = "0.1.0"
+authors = ["AilPhaune"]
+edition = "2021"
+
+[build-dependencies]
+
+[features]
+default = []
+
+[profile.dev]
+panic = "abort"
+opt-level = 0
+
+debug = true
+debug-assertions = false
+overflow-checks = false
+incremental = false
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+overflow-checks = false
+debug-assertions = false
+debug = true
+
+[package.metadata.cargo-xbuild.default-target]
+x86_64-unknown-none = true
+
+[package.metadata]
+rustflags = ["-C", "link-args=-Tlinker.ld"]

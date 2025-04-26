@@ -1,0 +1,11 @@
+#!/usr/bin/sh
+
+set -e
+
+cargo build --release
+mkdir -p kbuild
+ld.lld -T linker.ld -o kbuild/kernel.elf target/x86_64-unknown-none/release/libkernel.a --gc-sections
+
+objcopy --only-keep-debug kbuild/kernel.elf kbuild/kernel.debug
+objcopy --strip-debug kbuild/kernel.elf
+strip --strip-debug kbuild/kernel.elf
