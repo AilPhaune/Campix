@@ -12,8 +12,20 @@ SECTIONS {
         *(.rodata*)
         *(.lrodata*)
     }
-    .data ALIGN(4K) : { *(.data*) }
-    .bss ALIGN(4K) (NOLOAD) : { *(.bss*) }
+    .data ALIGN(4K) : {
+        *(.data*)
+        *(.ldata*)
+    }
+    .bss ALIGN(4K) (NOLOAD) : {
+        *(.bss*)
+        *(.lbss*)
+    }
 
     . = ALIGN(4K);
+
+    /DISCARD/ : {
+        *(.eh_frame*)
+        *(.eh_frame_hdr*)
+        *(.comment*)
+    }
 }

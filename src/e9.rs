@@ -47,3 +47,22 @@ macro_rules! printf {
         write!(writer, $fmt, $( $arg ),*).unwrap();
     }};
 }
+
+#[macro_export]
+macro_rules! println {
+    () => {{
+        $crate::printf!("\r\n");
+    }};
+    ($fmt: expr) => {{
+        use core::fmt::Write;
+        let mut writer = $crate::e9::E9Writer {};
+        write!(writer, $fmt).unwrap();
+        write!(writer, "\r\n").unwrap();
+    }};
+    ($fmt: expr, $( $arg: expr ),*) => {{
+        use core::fmt::Write;
+        let mut writer = $crate::e9::E9Writer {};
+        write!(writer, $fmt, $( $arg ),*).unwrap();
+        write!(writer, "\r\n").unwrap();
+    }};
+}
