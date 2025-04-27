@@ -1,7 +1,7 @@
 use core::arch::asm;
 use core::panic;
 
-use crate::{memory::OsMemoryRegion, printf};
+use crate::{memory::mem::OsMemoryRegion, println};
 
 #[repr(C, align(4096))]
 pub struct FreePage {
@@ -47,7 +47,7 @@ impl SimplePageAllocator {
 
     pub fn free_page(&mut self, page: *mut u8) {
         if (page as usize) & 0xFFF != 0 {
-            printf!("Trying to free unaligned page !\r\n");
+            println!("Trying to free unaligned page !");
             return;
         }
 

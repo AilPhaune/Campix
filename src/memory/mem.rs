@@ -1,7 +1,7 @@
 use crate::{
-    buddy_alloc::{self, BuddyPageAllocator},
+    memory::buddy_alloc::{self, BuddyPageAllocator},
     paging::{align_up, physical_to_virtual, MB2},
-    println,
+    printf, println,
 };
 
 #[derive(Default)]
@@ -154,6 +154,26 @@ pub unsafe fn init(
     pml4_ptr_phys: u64,
     begin_usable_memory: u64,
 ) {
+    printf!(
+        "Memory layout at: {:?} ({} entries)\n=== BEGIN MEMORY LAYOUT DUMP ===\n",
+        memory_layout_ptr,
+        memory_layout_entries
+    );
+    for i in 0..memory_layout_entries {
+        let region = memory_layout_ptr.offset(i as isize).read_unaligned();
+        let (s, e, u) = (region.start, region.end, region.usable);
+        printf!(
+            "REGION: {:016x} --> {:016x} (usable:{})\n",
+            s,
+            e,
+            match u {
+                0 => "no",
+                _ => "yes",
+            }
+        );
+    }
+    printf!("===  END MEMORY LAYOUT DUMP  ===\n\n");
+
     for i in 0..memory_layout_entries {
         let region = memory_layout_ptr.offset(i as isize).read_unaligned();
         let (s, e, u) = (region.start, region.end, region.usable);

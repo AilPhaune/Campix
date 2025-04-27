@@ -44,5 +44,7 @@ pub fn inl(port: u16) -> u32 {
 
 const UNUSED_PORT: u16 = 0x80;
 pub fn iowait() {
-    outb(UNUSED_PORT, 0);
+    for _ in 0..1000 {
+        outb(UNUSED_PORT, 0);
+    }
 }

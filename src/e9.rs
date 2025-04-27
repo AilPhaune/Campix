@@ -18,6 +18,9 @@ pub struct E9Writer {}
 impl core::fmt::Write for E9Writer {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         for c in s.chars() {
+            if c == '\n' {
+                write_char(b'\r');
+            }
             write_char(c as u8);
         }
         Ok(())
@@ -51,18 +54,18 @@ macro_rules! printf {
 #[macro_export]
 macro_rules! println {
     () => {{
-        $crate::printf!("\r\n");
+        $crate::printf!("\n");
     }};
     ($fmt: expr) => {{
         use core::fmt::Write;
         let mut writer = $crate::e9::E9Writer {};
         write!(writer, $fmt).unwrap();
-        write!(writer, "\r\n").unwrap();
+        write!(writer, "\n").unwrap();
     }};
     ($fmt: expr, $( $arg: expr ),*) => {{
         use core::fmt::Write;
         let mut writer = $crate::e9::E9Writer {};
         write!(writer, $fmt, $( $arg ),*).unwrap();
-        write!(writer, "\r\n").unwrap();
+        write!(writer, "\n").unwrap();
     }};
 }

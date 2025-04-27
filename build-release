@@ -4,7 +4,9 @@ set -e
 
 cargo build --release
 mkdir -p kbuild
-ld.lld -T linker.ld -o kbuild/kernel.elf target/x86_64-unknown-none/release/libkernel.a --gc-sections
+
+nasm -f elf64 src/interrupts/idt.asm -o kbuild/idt.o
+ld.lld -T linker.ld -o kbuild/kernel.elf target/x86_64-unknown-none/debug/libkernel.a kbuild/idt.o --gc-sections
 
 objcopy --only-keep-debug kbuild/kernel.elf kbuild/kernel.debug
 cp kbuild/kernel.debug kbuild/kernel.o

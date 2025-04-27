@@ -1,13 +1,16 @@
 #![no_std]
 #![no_main]
+#![feature(naked_functions)]
 
-use memory::OsMemoryRegion;
+use memory::mem::OsMemoryRegion;
 use paging::{init_paging, physical_to_virtual, DIRECT_MAPPING_OFFSET};
 
 extern crate alloc;
 
-pub mod buddy_alloc;
+pub mod drivers;
 pub mod e9;
+pub mod gdt;
+pub mod interrupts;
 pub mod io;
 pub mod memory;
 pub mod paging;
@@ -39,17 +42,17 @@ pub fn _start(
             page_alloc_end,
         );
 
-        memory::init(
+        gdt::init_gdtr();
+        interrupts::init();
+
+        memory::mem::init(
             physical_to_virtual(memory_layout_ptr) as *const OsMemoryRegion,
             memory_layout_entries,
             pml4_ptr_phys,
             begin_usable_memory,
         );
 
-        kmain(
-            physical_to_virtual(memory_layout_ptr) as *const OsMemoryRegion,
-            memory_layout_entries,
-        );
+        kmain();
     }
 }
 
@@ -64,17 +67,17 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
 #[no_mangle]
 unsafe fn _handle_panic(info: &core::panic::PanicInfo) {
-    printf!("Panic: {}\r\n", info.message());
+    printf!("Panic: {}\n", info.message());
 
     match info.location() {
         Some(loc) => {
-            printf!("Location: {}\r\n", loc);
+            printf!("Location: {}\n", loc);
         }
-        None => printf!("Location unknown !\r\n"),
+        None => printf!("Location unknown !\n"),
     }
 }
 
-unsafe fn kmain(memory_layout_ptr: *const OsMemoryRegion, memory_layout_entries: u64) -> ! {
+unsafe fn kmain() -> ! {
     let message = "Welcome to CampiOS !";
     let video_buffer = (0xb8000 + DIRECT_MAPPING_OFFSET) as *mut u8;
 
@@ -92,26 +95,6 @@ unsafe fn kmain(memory_layout_ptr: *const OsMemoryRegion, memory_layout_entries:
     io::outb(0x3d5, 80);
     io::outb(0x3d4, 0x0e);
     io::outb(0x3d5, 0);
-
-    printf!(
-        "Memory layout at: {:?} ({} entries)\r\n=== BEGIN MEMORY LAYOUT DUMP ===\r\n",
-        memory_layout_ptr,
-        memory_layout_entries
-    );
-    for i in 0..memory_layout_entries {
-        let region = memory_layout_ptr.offset(i as isize).read_unaligned();
-        let (s, e, u) = (region.start, region.end, region.usable);
-        printf!(
-            "REGION: {:016x} --> {:016x} (usable:{})\r\n",
-            s,
-            e,
-            match u {
-                0 => "no",
-                _ => "yes",
-            }
-        );
-    }
-    printf!("===  END MEMORY LAYOUT DUMP  ===\r\n\n");
 
     #[allow(clippy::empty_loop)]
     loop {}
