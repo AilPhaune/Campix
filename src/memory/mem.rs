@@ -23,7 +23,10 @@ unsafe impl core::alloc::GlobalAlloc for GlobalAlloc {
         }
         #[allow(static_mut_refs)]
         match &mut MAIN_BUDDY_ALLOCATOR {
-            None => core::ptr::null_mut(),
+            None => panic!(
+                "Try to allocate memory without an allocator !\n{:#?}",
+                layout
+            ),
             Some(allocator) => allocator
                 .alloc(layout.size() as u64)
                 .map(|addr| addr as *mut u8)

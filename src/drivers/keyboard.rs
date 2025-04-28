@@ -11,6 +11,7 @@ pub enum KeyboardEventKind {
     KeyUp,
 }
 
+/// Represents key modifiers, such as Shift, Control, Alt, Windows, NumLock, CapsLock, ScrollLock, and more
 #[repr(u16)]
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum KeyModifiers {
@@ -57,34 +58,42 @@ impl core::fmt::Debug for KeyModifiers {
 }
 
 impl KeyModifiers {
+    /// Creates a new KeyModifiers enum from a bitfield
     pub fn from_bits(bits: u16) -> KeyModifiers {
         unsafe { core::mem::transmute(bits) }
     }
 
+    /// Converts the KeyModifiers enum to a bitfield
     pub fn to_bits(&self) -> u16 {
         *self as u16
     }
 
+    /// Checks if no modifiers are pressed
     pub fn is_empty(&self) -> bool {
         *self == KeyModifiers::None
     }
 
+    /// Checks if all modifiers are pressed
     pub fn contains_all(&self, other: KeyModifiers) -> bool {
         self.to_bits() & other.to_bits() == other.to_bits()
     }
 
+    /// Checks if any modifier is pressed
     pub fn contains_any(&self, other: KeyModifiers) -> bool {
         self.to_bits() & other.to_bits() != 0
     }
 
+    /// Checks if any Shift is pressed
     pub fn has_shift(&self) -> bool {
         self.contains_any(KeyModifiers::LeftShift + KeyModifiers::RightShift)
     }
 
+    /// Checks if any Control is pressed
     pub fn has_control(&self) -> bool {
         self.contains_any(KeyModifiers::LeftControl + KeyModifiers::RightControl)
     }
 
+    /// Checks if any Alt is pressed
     pub fn has_alt(&self) -> bool {
         self.contains_any(KeyModifiers::LeftAlt + KeyModifiers::RightAlt)
     }
@@ -120,6 +129,7 @@ impl SubAssign<KeyModifiers> for KeyModifiers {
     }
 }
 
+/// Represents a key on the Multimedia section of the keyboard
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MultimediaKey {
     NextTrack,
@@ -140,6 +150,7 @@ pub enum MultimediaKey {
     MediaSelect,
 }
 
+/// Represents a key on the ACPI section of the keyboard
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcpiKey {
     Power,
@@ -147,6 +158,7 @@ pub enum AcpiKey {
     Wake,
 }
 
+/// Represents a key on the keyboard
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
     Escape,
@@ -185,6 +197,7 @@ pub enum Key {
 }
 
 impl Key {
+    /// Returns the modifier(s) that this key is associated with
     pub fn modifiers(&self) -> KeyModifiers {
         match self {
             Key::LeftControl => KeyModifiers::LeftControl,
@@ -197,6 +210,7 @@ impl Key {
         }
     }
 
+    /// Returns whether or not this key is associated to a printable character
     pub const fn printable(&self) -> bool {
         matches!(
             self,
@@ -209,6 +223,7 @@ impl Key {
         )
     }
 
+    /// Returns the printable character associated with this key if it exists
     pub const fn printable_char(&self) -> Option<char> {
         match self {
             Key::Character(c) => Some(*c),
@@ -222,6 +237,7 @@ impl Key {
     }
 }
 
+/// Represents a keyboard event
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyboardEvent {
     pub kind: KeyboardEventKind,
@@ -230,6 +246,7 @@ pub struct KeyboardEvent {
     pub mapped_key: Key,
 }
 
+/// Handles a keyboard event from the keyboard driver
 pub fn handle_keyboard_event(event: KeyboardEvent) {
     println!("{:?}", event);
 }

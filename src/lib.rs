@@ -2,6 +2,10 @@
 #![no_main]
 #![feature(naked_functions)]
 
+use drivers::{
+    disk::pata::{PataBus, PataController, PataDrive},
+    pci,
+};
 use memory::mem::OsMemoryRegion;
 use paging::{init_paging, physical_to_virtual, DIRECT_MAPPING_OFFSET};
 
@@ -25,7 +29,7 @@ pub fn _start(
     begin_usable_memory: u64,
 ) -> ! {
     unsafe {
-        println!("CampiOS Kernel");
+        println!("Campix Kernel");
         println!("Memory layout pointer: {:#x}", memory_layout_ptr);
         println!("Memory layout entries: {}", memory_layout_entries);
         println!("PML4 pointer: {:#x}", pml4_ptr_phys);
@@ -51,6 +55,14 @@ pub fn _start(
             pml4_ptr_phys,
             begin_usable_memory,
         );
+
+        {
+            println!("\nEnumerating PCI devices:");
+            let devices = pci::scan_bus();
+            for device in devices.iter() {
+                println!("{:?}", device);
+            }
+        }
 
         kmain();
     }
@@ -78,7 +90,7 @@ unsafe fn _handle_panic(info: &core::panic::PanicInfo) {
 }
 
 unsafe fn kmain() -> ! {
-    let message = "Welcome to CampiOS !";
+    let message = "Welcome to Campix !";
     let video_buffer = (0xb8000 + DIRECT_MAPPING_OFFSET) as *mut u8;
 
     for i in 0..(80 * 25) {
