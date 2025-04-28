@@ -56,9 +56,9 @@ pub fn pic_remap(offset1: usize, offset2: usize) {
     outb(PIC2_DATA, ICW4_8086);
     iowait();
 
-    outb(PIC1_DATA, 0);
+    outb(PIC1_DATA, 0xFF);
     iowait();
-    outb(PIC2_DATA, 0);
+    outb(PIC2_DATA, 0xFF);
     iowait();
 }
 

@@ -102,6 +102,7 @@ pub fn init_interrupts() {
             IDT.entries[i].set_handler(*f, KERNEL_CODE_SELECTOR as u16, 0, 0x8E);
         }
 
+        HANDLERS[0x20] = handlers::irq0_timer::handler;
         HANDLERS[0x21] = handlers::irq1_keyboard::handler;
 
         #[allow(static_mut_refs)]
