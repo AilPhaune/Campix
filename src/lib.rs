@@ -1,16 +1,14 @@
 #![no_std]
 #![no_main]
-#![feature(naked_functions)]
+#![feature(negative_impls)]
 
-use drivers::{
-    disk::pata::{PataBus, PataController, PataDrive},
-    pci,
-};
+use drivers::pci;
 use memory::mem::OsMemoryRegion;
 use paging::{init_paging, physical_to_virtual, DIRECT_MAPPING_OFFSET};
 
 extern crate alloc;
 
+pub mod data;
 pub mod drivers;
 pub mod e9;
 pub mod gdt;

@@ -28,6 +28,9 @@ overflow-checks = false
 debug-assertions = false
 debug = true
 
+[dependencies]
+spin = "0.10.0"
+
 [package.metadata.cargo-xbuild.default-target]
 x86_64-unknown-none = true
 

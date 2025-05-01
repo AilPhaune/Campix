@@ -290,3 +290,19 @@ pub fn scan_bus() -> Vec<PciDevice> {
 
     devices
 }
+
+static mut PCI_DEVICES: Option<Vec<PciDevice>> = None;
+
+pub fn get_devices() -> Vec<PciDevice> {
+    unsafe {
+        match PCI_DEVICES {
+            None => {}
+            Some(ref v) => {
+                return v.clone();
+            }
+        }
+        let devices = scan_bus();
+        PCI_DEVICES = Some(devices.clone());
+        devices
+    }
+}
