@@ -4,7 +4,8 @@
 
 use drivers::pci;
 use memory::mem::OsMemoryRegion;
-use paging::{init_paging, physical_to_virtual, DIRECT_MAPPING_OFFSET};
+use obsiboot::ObsiBootKernelParameters;
+use paging::{init_paging, physical_to_virtual};
 
 extern crate alloc;
 
@@ -15,43 +16,45 @@ pub mod gdt;
 pub mod interrupts;
 pub mod io;
 pub mod memory;
+pub mod obsiboot;
 pub mod paging;
+pub mod vesa;
 
 #[no_mangle]
-pub fn _start(
-    memory_layout_ptr: u64,
-    memory_layout_entries: u64,
-    pml4_ptr_phys: u64,
-    page_alloc_curr: u64,
-    page_alloc_end: u64,
-    begin_usable_memory: u64,
-) -> ! {
+pub fn _start(obsiboot_ptr: u64) -> ! {
+    let mut obsiboot =
+        unsafe { (obsiboot_ptr as *const ObsiBootKernelParameters).read_unaligned() };
+
     unsafe {
         println!("Campix Kernel");
-        println!("Memory layout pointer: {:#x}", memory_layout_ptr);
-        println!("Memory layout entries: {}", memory_layout_entries);
-        println!("PML4 pointer: {:#x}", pml4_ptr_phys);
-        println!("Page allocator start: {:#x}", page_alloc_curr);
-        println!("Page allocator end: {:#x}", page_alloc_end);
-        println!("Begin usable memory: {:#x}", begin_usable_memory);
+        println!("{:#?}", obsiboot);
         println!();
 
+        if obsiboot.obsiboot_struct_version != 1 {
+            let version = obsiboot.obsiboot_struct_version;
+            panic!("Unsupported ObsiBoot struct version: {}", version);
+        }
+
+        if !obsiboot.verify_checksum() {
+            panic!("Invalid ObsiBoot struct checksum");
+        }
+
         init_paging(
-            memory_layout_ptr as *const OsMemoryRegion,
-            memory_layout_entries,
-            pml4_ptr_phys,
-            page_alloc_curr,
-            page_alloc_end,
+            obsiboot.ptr_to_memory_layout as *const OsMemoryRegion,
+            obsiboot.memory_layout_entry_count as u64,
+            obsiboot.pml4_base_address as u64,
+            obsiboot.page_tables_page_allocator_current_free_page as u64,
+            obsiboot.page_tables_page_allocator_last_usable_page as u64,
         );
 
         gdt::init_gdtr();
         interrupts::init();
 
         memory::mem::init(
-            physical_to_virtual(memory_layout_ptr) as *const OsMemoryRegion,
-            memory_layout_entries,
-            pml4_ptr_phys,
-            begin_usable_memory,
+            physical_to_virtual(obsiboot.ptr_to_memory_layout as u64) as *const OsMemoryRegion,
+            obsiboot.memory_layout_entry_count as u64,
+            obsiboot.pml4_base_address as u64,
+            obsiboot.usable_kernel_memory_start as u64,
         );
 
         {
@@ -62,7 +65,7 @@ pub fn _start(
             }
         }
 
-        kmain();
+        kmain(obsiboot);
     }
 }
 
@@ -87,24 +90,19 @@ unsafe fn _handle_panic(info: &core::panic::PanicInfo) {
     }
 }
 
-unsafe fn kmain() -> ! {
-    let message = "Welcome to Campix !";
-    let video_buffer = (0xb8000 + DIRECT_MAPPING_OFFSET) as *mut u8;
+unsafe fn kmain(obsiboot: ObsiBootKernelParameters) -> ! {
+    vesa::parse_current_mode(&obsiboot);
+    let mode = vesa::get_mode_info();
 
-    for i in 0..(80 * 25) {
-        video_buffer.offset(i * 2 + 1).write_volatile(0x0f);
-        video_buffer
-            .offset(i * 2)
-            .write_volatile(match message.chars().nth(i as usize) {
-                None => 0,
-                Some(c) => c as u8,
-            });
+    println!("Kernel display using vesa mode {:#?}", mode);
+    println!("Available modes:");
+    for (mode, info) in vesa::iter_modes(&obsiboot) {
+        let vesa::VesaModeInfoStructure {
+            width, height, bpp, ..
+        } = info;
+        println!("{}: {}x{}:{}bpp", mode, width, height, bpp);
     }
-
-    io::outb(0x3d4, 0x0f);
-    io::outb(0x3d5, 80);
-    io::outb(0x3d4, 0x0e);
-    io::outb(0x3d5, 0);
+    println!();
 
     #[allow(clippy::empty_loop)]
     loop {}
