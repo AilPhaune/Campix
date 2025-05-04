@@ -78,6 +78,13 @@ impl VfsFile {
         }
     }
 
+    pub fn get_char_device(&self) -> Option<Arcrwb<dyn CharacterDevice>> {
+        match &self.kind {
+            VfsFileKind::CharacterDevice { device } => Some(device.clone()),
+            _ => None,
+        }
+    }
+
     pub fn is_directory(&self) -> bool {
         matches!(self.kind, VfsFileKind::Directory)
     }

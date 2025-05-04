@@ -2,7 +2,12 @@
 #![no_main]
 #![feature(negative_impls)]
 
-use drivers::{pci, vga::use_vga_device_mut};
+use alloc::vec::Vec;
+use drivers::{
+    pci,
+    vfs::{self, CharacterDevice},
+    vga::use_vga_device_mut,
+};
 use memory::mem::OsMemoryRegion;
 use obsiboot::ObsiBootKernelParameters;
 use paging::{init_paging, physical_to_virtual};
@@ -67,44 +72,62 @@ pub fn _start(obsiboot_ptr: u64) -> ! {
         }
 
         {
-            use_vga_device_mut(|vga| {
-                let width = vga.get_width() as usize;
-                let height = vga.get_height() as usize;
-                let max_iter = 400;
+            use crate::vfs::FileSystem;
+            let fs = vfs::get_vfs();
+            let guard = fs.read();
+            let vga = (*guard)
+                .get_file(&"/dev/vga".chars().collect::<Vec<_>>())
+                .unwrap()
+                .get_char_device()
+                .unwrap();
 
-                // Complex plane bounds
-                let scale_x = 3.5 / width as f64;
-                let scale_y = 2.0 / height as f64;
+            let mut wguard = vga.write();
+            let wvga = &mut **wguard as &mut dyn CharacterDevice;
 
-                for y in 0..height {
-                    let cy = y as f64 * scale_y - 1.0;
+            let params = vesa::get_mode_info();
 
-                    for x in 0..width {
-                        let cx = x as f64 * scale_x - 2.5;
-                        let mut zx = 0.0;
-                        let mut zy = 0.0;
-                        let mut iter = 0;
+            let width = params.width as usize;
+            let height = params.height as usize;
+            let max_iter = 100;
 
-                        while zx * zx + zy * zy <= 4.0 && iter < max_iter {
-                            let xtemp = zx * zx - zy * zy + cx;
-                            zy = 2.0 * zx * zy + cy;
-                            zx = xtemp;
-                            iter += 1;
-                        }
+            // Complex plane bounds
+            let scale_x = 3.5 / width as f64;
+            let scale_y = 2.0 / height as f64;
 
-                        let color = if iter == max_iter {
-                            0x000000 // black
-                        } else {
-                            let intensity = (255 * iter / max_iter) as u8;
-                            ((intensity as u32) << 16) | ((intensity as u32) << 8)
-                            // red+green = yellow gradient
-                        };
+            for y in 0..height {
+                let cy = y as f64 * scale_y - 1.0;
 
-                        let offset = y * width + x;
-                        vga.write_pixel_at_offset(offset as u64, color);
+                for x in 0..width {
+                    let cx = x as f64 * scale_x - 2.5;
+                    let mut zx = 0.0;
+                    let mut zy = 0.0;
+                    let mut iter = 0;
+
+                    while zx * zx + zy * zy <= 4.0 && iter < max_iter {
+                        let xtemp = zx * zx - zy * zy + cx;
+                        zy = 2.0 * zx * zy + cy;
+                        zx = xtemp;
+                        iter += 1;
                     }
-                }
 
+                    let color = if iter == max_iter {
+                        0x000000 // black
+                    } else {
+                        let intensity = (255 * iter / max_iter) as u8;
+                        ((intensity as u32) << 16) | ((intensity as u32) << 8)
+                        // red+green = yellow gradient
+                    };
+
+                    let offset = y * width + x;
+                    let buf = color.to_be_bytes();
+                    //vga.write_pixel_at_offset(offset as u64, color);
+                    wvga.write_chars(offset as u64 * 4, &buf).unwrap();
+                }
+            }
+        }
+
+        {
+            use_vga_device_mut(|vga| {
                 vga.swap_buffers();
             });
         }
@@ -135,7 +158,6 @@ unsafe fn _handle_panic(info: &core::panic::PanicInfo) {
 }
 
 unsafe fn kmain(obsiboot: ObsiBootKernelParameters) -> ! {
-    vesa::parse_current_mode(&obsiboot);
     let mode = vesa::get_mode_info();
 
     println!("Kernel display using vesa mode {:#?}", mode);
