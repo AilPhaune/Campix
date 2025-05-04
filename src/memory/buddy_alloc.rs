@@ -70,7 +70,7 @@ impl BuddyPageAllocator {
     /// Add a free block to the free list
     unsafe fn add_free_block(&mut self, addr: u64, order: u64) {
         assert_eq!(
-            addr & ((1 << (12 + order)) - 1),
+            (addr - self.base_addr) & ((PAGE_SIZE << order) - 1),
             0,
             "Address not properly aligned"
         );

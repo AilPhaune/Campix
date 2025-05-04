@@ -300,7 +300,7 @@ impl BlockDevice for PataBlockDevice {
     }
 }
 
-const PATA: u64 = u64::from_be_bytes([0x7b, 0x7b, 0x7b, 0x7b, b'p', b'a', b't', b'a']);
+const PATA: u64 = u64::from_be_bytes([0, 0, 0, 0, b'p', b'a', b't', b'a']);
 
 impl DevFsDriver for PataDevfsDriver {
     fn driver_id(&self) -> u64 {

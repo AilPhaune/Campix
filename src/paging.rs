@@ -391,3 +391,30 @@ pub fn virtual_to_physical(virt: u64) -> u64 {
         base + offset
     }
 }
+
+pub fn map_memory(addr: u64, len: u64, virt_offset: u64, flags: u64) {
+    unsafe {
+        let begin_2mb = align_up(addr, MB2 as u64);
+        let end_2mb = align_down(addr + len, MB2 as u64);
+        let begin_4kb = align_down(addr, KB4 as u64);
+        let end_4kb = align_up(addr + len, KB4 as u64);
+
+        let mut addr = begin_2mb;
+        while addr < end_2mb {
+            map_page_2mb(addr + virt_offset, addr, flags);
+            addr += MB2 as u64;
+        }
+
+        let mut addr = begin_4kb;
+        while addr < begin_2mb {
+            map_page_4kb(addr + virt_offset, addr, PAGE_ACCESSED | PAGE_RW);
+            addr += KB4 as u64;
+        }
+
+        let mut addr = end_2mb;
+        while addr < end_4kb {
+            map_page_4kb(addr + virt_offset, addr, flags);
+            addr += KB4 as u64;
+        }
+    }
+}

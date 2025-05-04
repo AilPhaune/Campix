@@ -13,12 +13,13 @@ use crate::drivers::{
     disk::init_disk_drivers,
     pci::{self, PciDevice},
     vfs::{
-        Arcrwb, BlockDevice, FileSystem, PathTraverse, Vfs, VfsError, VfsFile, VfsFileKind,
+        Arcrwb, AsAny, BlockDevice, FileSystem, PathTraverse, Vfs, VfsError, VfsFile, VfsFileKind,
         WeakArcrwb,
     },
+    vga::init_vga,
 };
 
-pub trait DevFsDriver: Send + Sync + Debug {
+pub trait DevFsDriver: Send + Sync + Debug + AsAny {
     fn driver_id(&self) -> u64;
     fn handles_device(&self, dev_fs: &mut DevFS, pci_device: &PciDevice) -> bool;
     fn get_device_files(
@@ -248,4 +249,5 @@ pub fn init_devfs(vfs: &mut Vfs) {
     let devfs = &mut **wguard;
     let devfs = devfs.as_any_mut().downcast_mut::<DevFS>().unwrap();
     init_disk_drivers(devfs);
+    init_vga(devfs);
 }

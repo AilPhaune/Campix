@@ -41,6 +41,7 @@ pub enum VfsError {
     BadBufferSize,
     NotDirectory,
     NotMountPoint,
+    OutOfBounds,
     DriverError(Box<dyn core::fmt::Debug>),
 }
 
@@ -49,6 +50,7 @@ pub enum VfsFileKind {
     File,
     Directory,
     BlockDevice { device: Arcrwb<dyn BlockDevice> },
+    CharacterDevice { device: Arcrwb<dyn CharacterDevice> },
     MountPoint { mounted_fs: Arcrwb<dyn FileSystem> },
 }
 
@@ -131,10 +133,16 @@ impl VfsFile {
     }
 }
 
-pub trait BlockDevice: Send + Sync + core::fmt::Debug {
+pub trait BlockDevice: Send + Sync + core::fmt::Debug + AsAny {
     fn get_block_size(&self) -> u64;
     fn read_block(&self, lba: u64, buf: &mut [u8]) -> Result<u64, VfsError>;
     fn write_block(&mut self, lba: u64, buf: &[u8]) -> Result<u64, VfsError>;
+}
+
+pub trait CharacterDevice: Send + Sync + core::fmt::Debug + AsAny {
+    fn get_size(&self) -> u64;
+    fn read_chars(&self, offset: u64, buf: &mut [u8]) -> Result<u64, VfsError>;
+    fn write_chars(&mut self, offset: u64, buf: &[u8]) -> Result<u64, VfsError>;
 }
 
 pub trait AsAny {
