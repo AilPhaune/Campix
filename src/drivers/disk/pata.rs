@@ -1,14 +1,27 @@
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeSet, sync::Arc, vec::Vec};
 use spin::RwLock;
 
 use crate::{
     drivers::{
-        fs::virt::devfs::{DevFS, DevFsDriver},
+        fs::virt::devfs::{fseek_helper, DevFS, DevFsDriver},
         pci::PciDevice,
-        vfs::{arcrwb_new_from_box, BlockDevice, FileSystem, VfsError, VfsFile, VfsFileKind},
+        vfs::{
+            arcrwb_new_from_box, BlockDevice, FileStat, FileSystem, VfsError, VfsFile, VfsFileKind,
+            FLAG_APPEND, FLAG_BINARY, FLAG_READ,
+        },
     },
     io::{inb, inw, outb, outw},
+    permissions,
 };
+
+pub fn is_pata_device(pci_device: &PciDevice) -> bool {
+    pci_device.class == 0x01
+        && pci_device.subclass == 0x01
+        && (pci_device.prog_if == 0x00
+            || pci_device.prog_if == 0x0A
+            || pci_device.prog_if == 0x80
+            || pci_device.prog_if == 0x8A)
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum PataErrtype {
@@ -227,19 +240,28 @@ impl PataController {
 
         PataDiskParams { sector_count }
     }
+
+    pub fn size_bytes(&self) -> u64 {
+        self.get_disk_params().sector_count * 512
+    }
 }
 
 #[derive(Debug)]
 pub struct PataDevfsDriver {
+    pci_device: PciDevice,
+    handles: BTreeSet<u64>,
+
     controller_pm: Arc<RwLock<PataController>>,
     controller_ps: Arc<RwLock<PataController>>,
     controller_sm: Arc<RwLock<PataController>>,
     controller_ss: Arc<RwLock<PataController>>,
 }
 
-impl Default for PataDevfsDriver {
-    fn default() -> Self {
+impl PataDevfsDriver {
+    pub fn new(pci_device: PciDevice) -> Self {
         let driver = Self {
+            pci_device,
+            handles: BTreeSet::new(),
             controller_pm: Arc::new(RwLock::new(PataController::new(
                 PataBus::Primary,
                 PataDrive::Master,
@@ -262,6 +284,10 @@ impl Default for PataDevfsDriver {
         let _ = driver.controller_sm.write().identify();
         let _ = driver.controller_ss.write().identify();
         driver
+    }
+
+    pub fn get_pci_device(&self) -> PciDevice {
+        self.pci_device
     }
 }
 
@@ -301,6 +327,15 @@ impl BlockDevice for PataBlockDevice {
 }
 
 const PATA: u64 = u64::from_be_bytes([0, 0, 0, 0, b'p', b'a', b't', b'a']);
+
+#[derive(Debug, Clone)]
+struct PataFsFileHandle {
+    mode: u64,
+    controller: Arc<RwLock<PataController>>,
+    position: u64,
+    last_sector: Option<u64>,
+    sector_cache: [u8; 512],
+}
 
 impl DevFsDriver for PataDevfsDriver {
     fn driver_id(&self) -> u64 {
@@ -353,11 +388,220 @@ impl DevFsDriver for PataDevfsDriver {
     }
 
     fn handles_device(&self, _dev_fs: &mut DevFS, pci_device: &PciDevice) -> bool {
-        pci_device.class == 0x01
-            && pci_device.subclass == 0x01
-            && (pci_device.prog_if == 0x00
-                || pci_device.prog_if == 0x0A
-                || pci_device.prog_if == 0x80
-                || pci_device.prog_if == 0x8A)
+        self.pci_device == *pci_device
+    }
+
+    fn fopen(&mut self, dev_fs: &mut DevFS, file: &VfsFile, mode: u64) -> Result<u64, VfsError> {
+        let controller = if file.name() == &['p', 'a', 't', 'a', '_', 'p', 'm'] {
+            &self.controller_pm
+        } else if file.name() == &['p', 'a', 't', 'a', '_', 'p', 's'] {
+            &self.controller_ps
+        } else if file.name() == &['p', 'a', 't', 'a', '_', 's', 'm'] {
+            &self.controller_sm
+        } else if file.name() == &['p', 'a', 't', 'a', '_', 's', 's'] {
+            &self.controller_ss
+        } else {
+            return Err(VfsError::PathNotFound);
+        };
+
+        if !controller.read().is_present() {
+            return Err(VfsError::PathNotFound);
+        }
+
+        if mode & FLAG_APPEND != 0 {
+            return Err(VfsError::InvalidOpenMode);
+        }
+        if mode & FLAG_BINARY == 0 {
+            return Err(VfsError::InvalidOpenMode);
+        }
+
+        let handle_data = PataFsFileHandle {
+            mode,
+            controller: controller.clone(),
+            last_sector: None,
+            position: 0,
+            sector_cache: [0; 512],
+        };
+        let handle = dev_fs.alloc_file_handle(handle_data, self.driver_id());
+
+        self.handles.insert(handle);
+        Ok(handle)
+    }
+
+    fn fclose(&mut self, dev_fs: &mut DevFS, handle: u64) -> Result<(), VfsError> {
+        self.handles.remove(&handle);
+        dev_fs.dealloc_file_handle::<PataFsFileHandle>(handle);
+        Ok(())
+    }
+
+    fn fflush(&mut self, _dev_fs: &mut DevFS, _handle: u64) -> Result<(), VfsError> {
+        Ok(())
+    }
+
+    fn fread(&mut self, dev_fs: &mut DevFS, handle: u64, buf: &mut [u8]) -> Result<u64, VfsError> {
+        if !self.handles.contains(&handle) {
+            return Err(VfsError::BadHandle);
+        }
+
+        let handle_data = unsafe {
+            &mut *(dev_fs
+                .get_handle_data::<PataFsFileHandle>(handle)
+                .ok_or(VfsError::BadHandle)?)
+        };
+        let controller = handle_data.controller.read();
+
+        if !controller.is_present() {
+            return Err(VfsError::PathNotFound);
+        }
+
+        if handle_data.mode & FLAG_READ == 0 {
+            return Err(VfsError::ActionNotAllowed);
+        }
+
+        let mut bytes_read = 0;
+        let to_read = buf
+            .len()
+            .min((controller.size_bytes() - handle_data.position) as usize);
+        let mut sector = handle_data.position / 512;
+
+        while bytes_read < to_read {
+            if
+            /* TODO: or if it's not write-locked */
+            handle_data.last_sector != Some(sector) {
+                controller
+                    .read_sector(sector, &mut handle_data.sector_cache)
+                    .map_err(|e| VfsError::DriverError(Box::new(e)))?;
+                handle_data.last_sector = Some(sector);
+            }
+
+            let sector_offset = (handle_data.position % 512) as usize;
+            let remaining_in_sector = 512 - sector_offset;
+            let remaining_to_read = to_read - bytes_read;
+            let to_copy = remaining_in_sector.min(remaining_to_read);
+
+            buf[bytes_read..bytes_read + to_copy]
+                .copy_from_slice(&handle_data.sector_cache[sector_offset..sector_offset + to_copy]);
+
+            handle_data.position += to_copy as u64;
+            bytes_read += to_copy;
+            sector = handle_data.position / 512;
+        }
+        Ok(bytes_read as u64)
+    }
+
+    fn fwrite(&mut self, dev_fs: &mut DevFS, handle: u64, buf: &[u8]) -> Result<u64, VfsError> {
+        if !self.handles.contains(&handle) {
+            return Err(VfsError::BadHandle);
+        }
+
+        let handle_data = unsafe {
+            &mut *(dev_fs
+                .get_handle_data::<PataFsFileHandle>(handle)
+                .ok_or(VfsError::BadHandle)?)
+        };
+        if (handle_data.mode & FLAG_READ) == 0 {
+            return Err(VfsError::ActionNotAllowed);
+        }
+
+        let mut controller = handle_data.controller.write();
+
+        if !controller.is_present() {
+            return Err(VfsError::PathNotFound);
+        }
+
+        let mut bytes_written = 0;
+        let to_write = buf
+            .len()
+            .min((controller.size_bytes() - handle_data.position) as usize);
+        let mut sector = handle_data.position / 512;
+
+        while bytes_written < to_write {
+            let sector_offset = (handle_data.position % 512) as usize;
+            let remaining_in_sector = 512 - sector_offset;
+            let remaining_to_write = to_write - bytes_written;
+            let to_copy = remaining_in_sector.min(remaining_to_write);
+
+            // Read back the sector if we're not overwriting all of its data
+            // TODO: if it's write-locked and already stores the sector data, no need to read it back
+            if to_copy != 512 {
+                controller
+                    .read_sector(sector, &mut handle_data.sector_cache)
+                    .map_err(|e| VfsError::DriverError(Box::new(e)))?;
+            }
+            handle_data.last_sector = Some(sector);
+
+            handle_data.sector_cache[sector_offset..sector_offset + to_copy]
+                .copy_from_slice(&buf[bytes_written..bytes_written + to_copy]);
+
+            controller
+                .write_sector(sector, &handle_data.sector_cache)
+                .map_err(|e| VfsError::DriverError(Box::new(e)))?;
+
+            handle_data.position += to_copy as u64;
+            bytes_written += to_copy;
+            sector = handle_data.position / 512;
+        }
+        Ok(bytes_written as u64)
+    }
+
+    fn fseek(
+        &mut self,
+        dev_fs: &mut DevFS,
+        handle: u64,
+        position: crate::drivers::vfs::SeekPosition,
+    ) -> Result<u64, VfsError> {
+        if !self.handles.contains(&handle) {
+            return Err(VfsError::BadHandle);
+        }
+
+        let handle_data = unsafe {
+            &mut *(dev_fs
+                .get_handle_data::<PataFsFileHandle>(handle)
+                .ok_or(VfsError::BadHandle)?)
+        };
+        let len = {
+            let controller = handle_data.controller.read();
+            if !controller.is_present() {
+                return Err(VfsError::PathNotFound);
+            }
+            controller.size_bytes()
+            // Drop the controller as early as possible to let other threads access it
+        };
+
+        handle_data.position = fseek_helper(position, handle_data.position, len)
+            .ok_or(VfsError::InvalidSeekPosition)?;
+
+        Ok(handle_data.position)
+    }
+
+    fn fstat(&mut self, dev_fs: &mut DevFS, handle: u64) -> Result<FileStat, VfsError> {
+        if !self.handles.contains(&handle) {
+            return Err(VfsError::BadHandle);
+        }
+
+        let handle_data = unsafe {
+            &mut *(dev_fs
+                .get_handle_data::<PataFsFileHandle>(handle)
+                .ok_or(VfsError::BadHandle)?)
+        };
+        let len = {
+            let controller = handle_data.controller.read();
+            if !controller.is_present() {
+                return Err(VfsError::PathNotFound);
+            }
+            controller.size_bytes()
+            // Drop the controller as early as possible to let other threads access it
+        };
+
+        Ok(FileStat {
+            size: len,
+            is_directory: false,
+            is_symlink: false,
+            permissions: permissions!(Owner:Read, Owner:Write).to_u32(),
+            owner_id: 0,
+            group_id: 0,
+            created_at: 0,
+            modified_at: 0,
+        })
     }
 }

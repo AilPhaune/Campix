@@ -6,7 +6,7 @@ const PCI_CONFIG_ADDRESS: u16 = 0xCF8;
 const PCI_CONFIG_DATA: u16 = 0xCFC;
 
 /// Represents a detected PCI device
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PciDevice {
     pub bus: u8,
     pub device: u8,
@@ -294,15 +294,20 @@ pub fn scan_bus() -> Vec<PciDevice> {
 static mut PCI_DEVICES: Option<Vec<PciDevice>> = None;
 
 pub fn get_devices() -> Vec<PciDevice> {
+    device_iterator().cloned().collect()
+}
+
+pub fn device_iterator() -> impl Iterator<Item = &'static PciDevice> {
     unsafe {
         match PCI_DEVICES {
             None => {}
             Some(ref v) => {
-                return v.clone();
+                return v.iter();
             }
         }
         let devices = scan_bus();
-        PCI_DEVICES = Some(devices.clone());
-        devices
+        PCI_DEVICES = Some(devices);
+        #[allow(static_mut_refs)]
+        PCI_DEVICES.as_ref().unwrap().iter()
     }
 }

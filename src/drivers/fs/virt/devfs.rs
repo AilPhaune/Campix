@@ -1,8 +1,12 @@
-use core::fmt::Debug;
+use core::{alloc::Layout, fmt::Debug};
 
 use alloc::{
+    alloc::{alloc, dealloc},
     boxed::Box,
-    collections::{btree_map, BTreeMap},
+    collections::{
+        btree_map::{self, Entry},
+        BTreeMap,
+    },
     string::{String, ToString},
     sync::Arc,
     vec::Vec,
@@ -13,11 +17,47 @@ use crate::drivers::{
     disk::init_disk_drivers,
     pci::{self, PciDevice},
     vfs::{
-        Arcrwb, AsAny, BlockDevice, FileSystem, PathTraverse, Vfs, VfsError, VfsFile, VfsFileKind,
-        WeakArcrwb,
+        Arcrwb, AsAny, BlockDevice, FileStat, FileSystem, PathTraverse, SeekPosition, Vfs,
+        VfsError, VfsFile, VfsFileKind, WeakArcrwb,
     },
     vga::init_vga,
 };
+
+pub const fn fseek_helper(seek: SeekPosition, current_position: u64, len: u64) -> Option<u64> {
+    match seek {
+        SeekPosition::FromStart(position) => {
+            if position > len {
+                None
+            } else {
+                Some(position)
+            }
+        }
+        SeekPosition::FromCurrent(position) => {
+            if position < 0 {
+                let abs_pos = position.unsigned_abs();
+                if abs_pos > current_position {
+                    None
+                } else {
+                    Some(current_position - abs_pos)
+                }
+            } else {
+                let (new_pos, overflow) = current_position.overflowing_add(position as u64);
+                if overflow || new_pos > len {
+                    None
+                } else {
+                    Some(new_pos)
+                }
+            }
+        }
+        SeekPosition::FromEnd(position) => {
+            if position > len {
+                None
+            } else {
+                Some(len - position)
+            }
+        }
+    }
+}
 
 pub trait DevFsDriver: Send + Sync + Debug + AsAny {
     fn driver_id(&self) -> u64;
@@ -27,6 +67,25 @@ pub trait DevFsDriver: Send + Sync + Debug + AsAny {
         dev_fs: &mut DevFS,
         pci_device: &PciDevice,
     ) -> Result<Vec<VfsFile>, VfsError>;
+
+    fn fopen(&mut self, dev_fs: &mut DevFS, file: &VfsFile, mode: u64) -> Result<u64, VfsError>;
+    fn fclose(&mut self, dev_fs: &mut DevFS, handle: u64) -> Result<(), VfsError>;
+    fn fread(&mut self, dev_fs: &mut DevFS, handle: u64, buf: &mut [u8]) -> Result<u64, VfsError>;
+    fn fwrite(&mut self, dev_fs: &mut DevFS, handle: u64, buf: &[u8]) -> Result<u64, VfsError>;
+    fn fflush(&mut self, dev_fs: &mut DevFS, handle: u64) -> Result<(), VfsError>;
+    fn fstat(&mut self, dev_fs: &mut DevFS, handle: u64) -> Result<FileStat, VfsError>;
+    fn fseek(
+        &mut self,
+        dev_fs: &mut DevFS,
+        handle: u64,
+        position: SeekPosition,
+    ) -> Result<u64, VfsError>;
+}
+
+#[derive(Debug, Clone)]
+pub struct DevFsHandleData<T: Sized + Clone + Debug> {
+    data: T,
+    layout: Layout,
 }
 
 #[derive(Debug)]
@@ -36,6 +95,8 @@ pub struct DevFS {
     dev_to_driver: BTreeMap<usize, u64>,
     dev_to_file: BTreeMap<usize, Vec<VfsFile>>,
     name_to_dev: BTreeMap<Vec<char>, usize>,
+
+    handles: BTreeMap<u64, u64>,
 
     os_id: u64,
     parent_fs_os_id: u64,
@@ -84,6 +145,39 @@ impl DevFS {
             true
         } else {
             false
+        }
+    }
+
+    pub fn alloc_file_handle<T: Sized + Clone + Debug>(&mut self, data: T, driver_id: u64) -> u64 {
+        let handle = unsafe {
+            let layout = Layout::from_size_align_unchecked(
+                size_of::<DevFsHandleData<T>>(),
+                align_of::<DevFsHandleData<T>>(),
+            );
+            let handle = alloc(layout) as *mut DevFsHandleData<T>;
+            handle.write(DevFsHandleData { data, layout });
+            handle as u64
+        };
+        self.handles.insert(handle, driver_id);
+        handle
+    }
+
+    /// # Safety
+    /// Caller must ensure that the handle is valid and was allocated using `alloc_file_handle` with the same `T` type
+    pub unsafe fn get_handle_data<T: Sized + Clone + Debug>(&self, handle: u64) -> Option<*mut T> {
+        let handle_data = handle as *mut DevFsHandleData<T>;
+        Some(&mut (*handle_data).data as *mut T)
+    }
+
+    pub fn dealloc_file_handle<T: Sized + Clone + Debug>(&mut self, handle: u64) {
+        if self.handles.contains_key(&handle) {
+            unsafe {
+                dealloc(
+                    handle as *mut u8,
+                    (*(handle as *mut DevFsHandleData<T>)).layout,
+                )
+            };
+            self.handles.remove(&handle);
         }
     }
 }
@@ -221,6 +315,121 @@ impl FileSystem for DevFS {
             .ok_or(VfsError::FileSystemNotMounted)?
             .clone())
     }
+
+    fn sync(&mut self) -> Result<(), VfsError> {
+        Ok(())
+    }
+
+    fn fopen(&mut self, file: &VfsFile, mode: u64) -> Result<u64, VfsError> {
+        if file.fs() != self.os_id() {
+            return Err(VfsError::FileSystemMismatch);
+        }
+        if file.name() == &['/'] {
+            return Err(VfsError::ActionNotAllowed);
+        }
+
+        let device = self
+            .name_to_dev
+            .get(file.name())
+            .cloned()
+            .ok_or(VfsError::PathNotFound)?;
+
+        let driver_id = *self.dev_to_driver.get(&device).unwrap();
+
+        let driver = self.drivers.get(&driver_id).unwrap().clone();
+        let handle = {
+            let mut wguard = driver.write();
+            // This automatically inserts the handle by calling `alloc_file_handle`
+            (*wguard).fopen(self, file, mode)?
+        };
+
+        Ok(handle)
+    }
+
+    fn fclose(&mut self, handle: u64) -> Result<(), VfsError> {
+        match self.handles.entry(handle) {
+            Entry::Vacant(_) => Err(VfsError::ActionNotAllowed),
+            Entry::Occupied(o) => {
+                let driver = match self.drivers.get(o.get()) {
+                    None => return Err(VfsError::ActionNotAllowed),
+                    Some(d) => d.clone(),
+                };
+                let mut wguard = driver.write();
+                // This automatically removes the handle by calling `dealloc_file_handle`
+                (*wguard).fclose(self, handle)
+            }
+        }
+    }
+
+    fn fseek(&mut self, handle: u64, position: SeekPosition) -> Result<u64, VfsError> {
+        match self.handles.entry(handle) {
+            Entry::Vacant(_) => Err(VfsError::ActionNotAllowed),
+            Entry::Occupied(o) => {
+                let driver = match self.drivers.get(o.get()) {
+                    None => return Err(VfsError::ActionNotAllowed),
+                    Some(d) => d.clone(),
+                };
+                let mut wguard = driver.write();
+                (*wguard).fseek(self, handle, position)
+            }
+        }
+    }
+
+    fn fwrite(&mut self, handle: u64, buf: &[u8]) -> Result<u64, VfsError> {
+        match self.handles.entry(handle) {
+            Entry::Vacant(_) => Err(VfsError::ActionNotAllowed),
+            Entry::Occupied(o) => {
+                let driver = match self.drivers.get(o.get()) {
+                    None => return Err(VfsError::ActionNotAllowed),
+                    Some(d) => d.clone(),
+                };
+                let mut wguard = driver.write();
+                (*wguard).fwrite(self, handle, buf)
+            }
+        }
+    }
+
+    fn fread(&mut self, handle: u64, buf: &mut [u8]) -> Result<u64, VfsError> {
+        match self.handles.entry(handle) {
+            Entry::Vacant(_) => Err(VfsError::ActionNotAllowed),
+            Entry::Occupied(o) => {
+                let driver = match self.drivers.get(o.get()) {
+                    None => return Err(VfsError::ActionNotAllowed),
+                    Some(d) => d.clone(),
+                };
+                let mut wguard = driver.write();
+                (*wguard).fread(self, handle, buf)
+            }
+        }
+    }
+
+    fn fflush(&mut self, handle: u64) -> Result<(), VfsError> {
+        match self.handles.entry(handle) {
+            Entry::Vacant(_) => Err(VfsError::ActionNotAllowed),
+            Entry::Occupied(o) => {
+                let driver = match self.drivers.get(o.get()) {
+                    None => return Err(VfsError::ActionNotAllowed),
+                    Some(d) => d.clone(),
+                };
+                let mut wguard = driver.write();
+                (*wguard).fflush(self, handle)
+            }
+        }
+    }
+
+    fn fstat(&mut self, handle: u64) -> Result<FileStat, VfsError> {
+        match self.handles.entry(handle) {
+            Entry::Vacant(_) => Err(VfsError::ActionNotAllowed),
+            Entry::Occupied(o) => {
+                let driver = match self.drivers.get(o.get()) {
+                    None => return Err(VfsError::ActionNotAllowed),
+                    Some(d) => d.clone(),
+                };
+                let mut wguard = driver.write();
+                (*wguard).fstat(self, handle)
+            }
+        }
+    }
 }
 
 pub fn init_devfs(vfs: &mut Vfs) {
@@ -230,6 +439,7 @@ pub fn init_devfs(vfs: &mut Vfs) {
         dev_to_driver: BTreeMap::new(),
         dev_to_file: BTreeMap::new(),
         name_to_dev: BTreeMap::new(),
+        handles: BTreeMap::new(),
         mnt: None,
         os_id: 0,
         parent_fs_os_id: 0,

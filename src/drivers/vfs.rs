@@ -42,6 +42,10 @@ pub enum VfsError {
     NotDirectory,
     NotMountPoint,
     OutOfBounds,
+    UnknownError,
+    InvalidOpenMode,
+    InvalidSeekPosition,
+    BadHandle,
     DriverError(Box<dyn core::fmt::Debug>),
 }
 
@@ -97,6 +101,10 @@ impl VfsFile {
         matches!(self.kind, VfsFileKind::BlockDevice { .. })
     }
 
+    pub fn is_char_device(&self) -> bool {
+        matches!(self.kind, VfsFileKind::CharacterDevice { .. })
+    }
+
     pub fn is_mount_point(&self) -> bool {
         matches!(self.kind, VfsFileKind::MountPoint { .. })
     }
@@ -150,11 +158,36 @@ pub trait CharacterDevice: Send + Sync + core::fmt::Debug + AsAny {
     fn get_size(&self) -> u64;
     fn read_chars(&self, offset: u64, buf: &mut [u8]) -> Result<u64, VfsError>;
     fn write_chars(&mut self, offset: u64, buf: &[u8]) -> Result<u64, VfsError>;
+    fn flush(&mut self) -> Result<(), VfsError>;
 }
 
 pub trait AsAny {
     fn as_any_mut(&mut self) -> &mut dyn Any;
     fn as_any(&self) -> &dyn Any;
+}
+
+pub const FLAG_READ: u64 = 1 << 0;
+pub const FLAG_WRITE: u64 = 1 << 1;
+pub const FLAG_APPEND: u64 = 1 << 2;
+pub const FLAG_BINARY: u64 = 1 << 3;
+
+#[derive(Debug, Clone, Copy)]
+pub enum SeekPosition {
+    FromStart(u64),
+    FromCurrent(i64),
+    FromEnd(u64),
+}
+
+#[derive(Debug)]
+pub struct FileStat {
+    pub size: u64,
+    pub created_at: u64,
+    pub modified_at: u64,
+    pub permissions: u32,
+    pub is_directory: bool,
+    pub is_symlink: bool,
+    pub owner_id: u32,
+    pub group_id: u32,
 }
 
 pub trait FileSystem: Send + Sync + core::fmt::Debug + AsAny {
@@ -221,6 +254,34 @@ pub trait FileSystem: Send + Sync + core::fmt::Debug + AsAny {
 
     /// Gets the root file system
     fn get_vfs(&self) -> Result<WeakArcrwb<Vfs>, VfsError>;
+
+    /// Syncs the file system
+    fn sync(&mut self) -> Result<(), VfsError>;
+
+    /// Opens a file
+    /// Returns the file handle
+    fn fopen(&mut self, file: &VfsFile, mode: u64) -> Result<u64, VfsError>;
+
+    /// Closes a file
+    fn fclose(&mut self, handle: u64) -> Result<(), VfsError>;
+
+    /// Seeks a file
+    /// Returns the new position
+    fn fseek(&mut self, handle: u64, position: SeekPosition) -> Result<u64, VfsError>;
+
+    /// Reads from a file
+    /// Returns the number of bytes read
+    fn fread(&mut self, handle: u64, buf: &mut [u8]) -> Result<u64, VfsError>;
+
+    /// Writes to a file
+    /// Returns the number of bytes written
+    fn fwrite(&mut self, handle: u64, buf: &[u8]) -> Result<u64, VfsError>;
+
+    /// Flushes a file
+    fn fflush(&mut self, handle: u64) -> Result<(), VfsError>;
+
+    /// Gets stats of a file
+    fn fstat(&mut self, handle: u64) -> Result<FileStat, VfsError>;
 }
 
 pub struct PathSplitter<'a> {
@@ -335,6 +396,22 @@ impl Vfs {
     pub fn next_os_id(&mut self) -> u64 {
         self.os_id_count += 1;
         self.os_id_count
+    }
+
+    pub fn get_os_by_id(&self, id: u64) -> Option<Arcrwb<dyn FileSystem>> {
+        self.fs_by_id.read().get(&id).cloned()
+    }
+
+    pub fn get_os_by_name(&self, name: &[char]) -> Option<Arcrwb<dyn FileSystem>> {
+        self.fs_by_name.read().get(name).cloned()
+    }
+
+    pub fn register_fs(&self, os_id: u64, name: &[char], ptr: &Arcrwb<dyn FileSystem>) {
+        let mut wguard = self.fs_by_id.write();
+        wguard.insert(os_id, ptr.clone());
+
+        let mut wguard = self.fs_by_name.write();
+        wguard.insert(name.to_vec(), ptr.clone());
     }
 }
 
@@ -495,19 +572,13 @@ impl FileSystem for Vfs {
         let os_id = self.next_os_id();
         let ptr = arcrwb_new_from_box(fs);
 
-        {
-            let mut wguard = self.fs_by_id.write();
-            wguard.insert(os_id, ptr.clone());
-
-            let mut wguard = self.fs_by_name.write();
-            wguard.insert(name.to_vec(), ptr.clone());
-        }
+        self.register_fs(os_id, &name, &ptr);
 
         let mount_point = VfsFile {
             kind: VfsFileKind::MountPoint {
                 mounted_fs: ptr.clone(),
             },
-            name: name.to_vec(),
+            name,
             size: 0,
             parent_fs: self.os_id(),
             fs: os_id,
@@ -565,6 +636,42 @@ impl FileSystem for Vfs {
             .as_ref()
             .ok_or(VfsError::FileSystemNotMounted)?
             .clone())
+    }
+
+    fn sync(&mut self) -> Result<(), VfsError> {
+        Ok(())
+    }
+
+    fn fopen(&mut self, file: &VfsFile, _mode: u64) -> Result<u64, VfsError> {
+        // Vfs only contains the root directory, and mount points which can't be opened
+        if file.fs != self.os_id() {
+            return Err(VfsError::FileSystemMismatch);
+        }
+        Err(VfsError::ActionNotAllowed)
+    }
+
+    fn fclose(&mut self, _file: u64) -> Result<(), VfsError> {
+        Err(VfsError::ActionNotAllowed)
+    }
+
+    fn fflush(&mut self, _handle: u64) -> Result<(), VfsError> {
+        Err(VfsError::ActionNotAllowed)
+    }
+
+    fn fread(&mut self, _handle: u64, _buf: &mut [u8]) -> Result<u64, VfsError> {
+        Err(VfsError::ActionNotAllowed)
+    }
+
+    fn fwrite(&mut self, _handle: u64, _buf: &[u8]) -> Result<u64, VfsError> {
+        Err(VfsError::ActionNotAllowed)
+    }
+
+    fn fstat(&mut self, _handle: u64) -> Result<FileStat, VfsError> {
+        Err(VfsError::ActionNotAllowed)
+    }
+
+    fn fseek(&mut self, _handle: u64, _position: SeekPosition) -> Result<u64, VfsError> {
+        Err(VfsError::ActionNotAllowed)
     }
 }
 

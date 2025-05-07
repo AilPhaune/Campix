@@ -5,8 +5,7 @@
 use alloc::vec::Vec;
 use drivers::{
     pci,
-    vfs::{self, CharacterDevice},
-    vga::use_vga_device_mut,
+    vfs::{self, Vfs, FLAG_BINARY, FLAG_READ, FLAG_WRITE},
 };
 use memory::mem::OsMemoryRegion;
 use obsiboot::ObsiBootKernelParameters;
@@ -74,15 +73,18 @@ pub fn _start(obsiboot_ptr: u64) -> ! {
         {
             use crate::vfs::FileSystem;
             let fs = vfs::get_vfs();
-            let guard = fs.read();
-            let vga = (*guard)
+
+            let guard: &Vfs = &fs.read();
+            let vgafile = guard
                 .get_file(&"/dev/vga".chars().collect::<Vec<_>>())
-                .unwrap()
-                .get_char_device()
                 .unwrap();
 
-            let mut wguard = vga.write();
-            let wvga = &mut **wguard as &mut dyn CharacterDevice;
+            let fs = guard.get_os_by_id(vgafile.fs()).unwrap();
+            let guard: &mut dyn FileSystem = &mut **fs.write();
+
+            let vga = guard
+                .fopen(&vgafile, FLAG_READ | FLAG_WRITE | FLAG_BINARY)
+                .unwrap();
 
             let params = vesa::get_mode_info();
 
@@ -93,6 +95,8 @@ pub fn _start(obsiboot_ptr: u64) -> ! {
             // Complex plane bounds
             let scale_x = 3.5 / width as f64;
             let scale_y = 2.0 / height as f64;
+
+            let mut buffer = Vec::with_capacity(width * height * 4);
 
             for y in 0..height {
                 let cy = y as f64 * scale_y - 1.0;
@@ -114,22 +118,16 @@ pub fn _start(obsiboot_ptr: u64) -> ! {
                         0x000000 // black
                     } else {
                         let intensity = (255 * iter / max_iter) as u8;
-                        ((intensity as u32) << 16) | ((intensity as u32) << 8)
-                        // red+green = yellow gradient
+                        (intensity as u32) << 16
                     };
 
-                    let offset = y * width + x;
-                    let buf = color.to_be_bytes();
-                    //vga.write_pixel_at_offset(offset as u64, color);
-                    wvga.write_chars(offset as u64 * 4, &buf).unwrap();
+                    let buf = color.to_le_bytes();
+                    buffer.extend_from_slice(&buf);
                 }
             }
-        }
-
-        {
-            use_vga_device_mut(|vga| {
-                vga.swap_buffers();
-            });
+            guard.fwrite(vga, &buffer).unwrap();
+            guard.fflush(vga).unwrap();
+            guard.fclose(vga).unwrap();
         }
 
         kmain(obsiboot);

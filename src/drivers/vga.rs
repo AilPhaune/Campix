@@ -1,18 +1,19 @@
 use core::{alloc::Layout, panic};
 
-use alloc::{alloc::alloc_zeroed, boxed::Box, vec::Vec};
+use alloc::{alloc::alloc_zeroed, boxed::Box, collections::BTreeSet, vec::Vec};
 use spin::RwLock;
 
 use crate::{
-    paging,
+    paging, permissions,
     vesa::{get_mode_info, VesaModeInfoStructure},
 };
 
 use super::{
-    fs::virt::devfs::{DevFS, DevFsDriver},
+    fs::virt::devfs::{fseek_helper, DevFS, DevFsDriver},
     pci::PciDevice,
     vfs::{
-        arcrwb_new_from_box, Arcrwb, CharacterDevice, FileSystem, VfsError, VfsFile, VfsFileKind,
+        arcrwb_new_from_box, Arcrwb, CharacterDevice, FileStat, FileSystem, VfsError, VfsFile,
+        VfsFileKind, FLAG_APPEND, FLAG_BINARY, FLAG_READ, FLAG_WRITE,
     },
 };
 
@@ -98,7 +99,8 @@ impl VgaCharDevice {
         let layout = Layout::from_size_align(double_buffer_size as usize, 4).unwrap();
         let double_buffer = RwLock::new(unsafe { alloc_zeroed(layout) as usize });
 
-        let frame_buffer_is_xrgb = mode_info.red_position == 16
+        let frame_buffer_is_xrgb = bpp == 32
+            && mode_info.red_position == 16
             && mode_info.green_position == 8
             && mode_info.blue_position == 0;
 
@@ -173,11 +175,17 @@ impl VgaCharDevice {
         let height = self.height;
 
         if self.frame_buffer_is_xrgb {
-            for y in 0..height {
+            if pitch == width * 4 {
                 unsafe {
-                    let src = backbuffer.add((y * width * 4) as usize);
-                    let dst = framebuffer.add((y * pitch) as usize);
-                    core::ptr::copy_nonoverlapping(src, dst, width as usize * 4);
+                    core::ptr::copy_nonoverlapping(backbuffer, framebuffer, self.size as usize);
+                }
+            } else {
+                for y in 0..height {
+                    unsafe {
+                        let src = backbuffer.add((y * width * 4) as usize);
+                        let dst = framebuffer.add((y * pitch) as usize);
+                        core::ptr::copy_nonoverlapping(src, dst, width as usize * 4);
+                    }
                 }
             }
         } else if self.bpp == 32 {
@@ -277,16 +285,40 @@ impl CharacterDevice for VgaCharDevice {
         }
         Ok(max_write)
     }
+
+    fn flush(&mut self) -> Result<(), VfsError> {
+        self.swap_buffers();
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct VgaFsFileHandle {
+    mode: u64,
+    device: Arcrwb<dyn CharacterDevice>,
+    position: u64,
 }
 
 #[derive(Debug)]
 pub struct VgaDriver {
     device: Arcrwb<dyn CharacterDevice>,
+    size: u64,
+    handles: BTreeSet<u64>,
 }
 
 impl VgaDriver {
     pub fn get_device(&self) -> Arcrwb<dyn CharacterDevice> {
         self.device.clone()
+    }
+
+    pub fn from_device(device: VgaCharDevice) -> Self {
+        let size = device.get_size();
+        Self {
+            device: arcrwb_new_from_box(Box::new(device)),
+            handles: BTreeSet::new(),
+            size,
+        }
     }
 }
 
@@ -319,6 +351,134 @@ impl DevFsDriver for VgaDriver {
             dev_fs.os_id(),
         )])
     }
+
+    fn fopen(&mut self, dev_fs: &mut DevFS, file: &VfsFile, mode: u64) -> Result<u64, VfsError> {
+        if file.name() != &['v', 'g', 'a'] {
+            return Err(VfsError::PathNotFound);
+        }
+
+        let handle_data = VgaFsFileHandle {
+            mode,
+            device: self.device.clone(),
+            position: 0,
+        };
+
+        if mode & FLAG_APPEND != 0 {
+            return Err(VfsError::InvalidOpenMode);
+        }
+        if mode & FLAG_BINARY == 0 {
+            return Err(VfsError::InvalidOpenMode);
+        }
+
+        let handle = dev_fs.alloc_file_handle::<VgaFsFileHandle>(handle_data, self.driver_id());
+        self.handles.insert(handle);
+        Ok(handle)
+    }
+
+    fn fclose(&mut self, dev_fs: &mut DevFS, handle: u64) -> Result<(), VfsError> {
+        if !self.handles.contains(&handle) {
+            return Err(VfsError::ActionNotAllowed);
+        }
+        self.handles.remove(&handle);
+        dev_fs.dealloc_file_handle::<VgaFsFileHandle>(handle);
+        Ok(())
+    }
+
+    fn fstat(&mut self, _dev_fs: &mut DevFS, handle: u64) -> Result<FileStat, VfsError> {
+        if !self.handles.contains(&handle) {
+            return Err(VfsError::ActionNotAllowed);
+        }
+        Ok(FileStat {
+            size: self.size,
+            is_directory: false,
+            is_symlink: false,
+            permissions: permissions!(Owner:Read, Owner:Write).to_u32(),
+            owner_id: 0,
+            group_id: 0,
+            created_at: 0,
+            modified_at: 0,
+        })
+    }
+
+    fn fseek(
+        &mut self,
+        dev_fs: &mut DevFS,
+        handle: u64,
+        position: super::vfs::SeekPosition,
+    ) -> Result<u64, VfsError> {
+        if !self.handles.contains(&handle) {
+            return Err(VfsError::BadHandle);
+        }
+        let handle_data = unsafe {
+            &mut *(dev_fs
+                .get_handle_data::<VgaFsFileHandle>(handle)
+                .ok_or(VfsError::BadHandle)?)
+        };
+
+        handle_data.position = fseek_helper(position, handle_data.position, self.size)
+            .ok_or(VfsError::InvalidSeekPosition)?;
+
+        Ok(handle_data.position)
+    }
+
+    fn fread(&mut self, dev_fs: &mut DevFS, handle: u64, buf: &mut [u8]) -> Result<u64, VfsError> {
+        if !self.handles.contains(&handle) {
+            return Err(VfsError::BadHandle);
+        }
+        let handle_data = unsafe {
+            &mut *(dev_fs
+                .get_handle_data::<VgaFsFileHandle>(handle)
+                .ok_or(VfsError::BadHandle)?)
+        };
+
+        if handle_data.mode & FLAG_READ == 0 {
+            return Err(VfsError::ActionNotAllowed);
+        }
+
+        let device = handle_data.device.read();
+        let device = &**device;
+
+        let bytes_read = device.read_chars(handle_data.position, buf)?;
+        handle_data.position += bytes_read;
+        Ok(bytes_read)
+    }
+
+    fn fwrite(&mut self, dev_fs: &mut DevFS, handle: u64, buf: &[u8]) -> Result<u64, VfsError> {
+        if !self.handles.contains(&handle) {
+            return Err(VfsError::BadHandle);
+        }
+        let handle_data = unsafe {
+            &mut *(dev_fs
+                .get_handle_data::<VgaFsFileHandle>(handle)
+                .ok_or(VfsError::BadHandle)?)
+        };
+
+        if handle_data.mode & FLAG_WRITE == 0 {
+            return Err(VfsError::ActionNotAllowed);
+        }
+
+        let mut device = handle_data.device.write();
+        let device = &mut **device;
+
+        let bytes_written = device.write_chars(handle_data.position, buf)?;
+        handle_data.position += bytes_written;
+        Ok(bytes_written)
+    }
+
+    fn fflush(&mut self, dev_fs: &mut DevFS, handle: u64) -> Result<(), VfsError> {
+        if !self.handles.contains(&handle) {
+            return Err(VfsError::BadHandle);
+        }
+        let handle_data = unsafe {
+            &mut *(dev_fs
+                .get_handle_data::<VgaFsFileHandle>(handle)
+                .ok_or(VfsError::BadHandle)?)
+        };
+        let mut device = handle_data.device.write();
+        let device = &mut **device;
+
+        device.flush()
+    }
 }
 
 static mut VGA_DRIVER: Option<Arcrwb<dyn DevFsDriver>> = None;
@@ -328,9 +488,9 @@ pub fn get_vga_driver() -> Arcrwb<dyn DevFsDriver> {
     unsafe {
         if VGA_DRIVER.is_none() {
             let mode_info = get_mode_info();
-            VGA_DRIVER = Some(arcrwb_new_from_box(Box::new(VgaDriver {
-                device: arcrwb_new_from_box(Box::new(VgaCharDevice::new(mode_info))),
-            })));
+            VGA_DRIVER = Some(arcrwb_new_from_box(Box::new(VgaDriver::from_device(
+                VgaCharDevice::new(mode_info),
+            ))));
         }
         VGA_DRIVER.clone().unwrap()
     }
