@@ -1,6 +1,5 @@
 #![no_std]
 #![no_main]
-#![feature(negative_impls)]
 
 use alloc::string::String;
 use data::file::File;
