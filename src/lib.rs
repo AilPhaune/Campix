@@ -2,10 +2,11 @@
 #![no_main]
 #![feature(negative_impls)]
 
-use alloc::vec::Vec;
+use alloc::string::String;
+use data::file::File;
 use drivers::{
     pci,
-    vfs::{self, Vfs, OPEN_MODE_BINARY, OPEN_MODE_READ, OPEN_MODE_WRITE},
+    vfs::{OPEN_MODE_BINARY, OPEN_MODE_READ},
 };
 use memory::mem::OsMemoryRegion;
 use obsiboot::ObsiBootKernelParameters;
@@ -71,69 +72,66 @@ pub fn _start(obsiboot_ptr: u64) -> ! {
         }
 
         {
-            use crate::vfs::FileSystem;
-            let fs = vfs::get_vfs();
-
-            let guard: &Vfs = &fs.read();
-            let vgafile = guard
-                .get_file(&"/dev/vga".chars().collect::<Vec<_>>())
-                .unwrap();
-
-            let fs = guard.get_fs_by_id(vgafile.fs()).unwrap();
-            let guard: &mut dyn FileSystem = &mut **fs.write();
-
-            let vga = guard
-                .fopen(
-                    &vgafile,
-                    OPEN_MODE_READ | OPEN_MODE_WRITE | OPEN_MODE_BINARY,
-                )
-                .unwrap();
-
-            let params = vesa::get_mode_info();
-
-            let width = params.width as usize;
-            let height = params.height as usize;
-            let max_iter = 100;
-
-            // Complex plane bounds
-            let scale_x = 3.5 / width as f64;
-            let scale_y = 2.0 / height as f64;
-
-            let mut buffer = Vec::with_capacity(width * height * 4);
-
-            for y in 0..height {
-                let cy = y as f64 * scale_y - 1.0;
-
-                for x in 0..width {
-                    let cx = x as f64 * scale_x - 2.5;
-                    let mut zx = 0.0;
-                    let mut zy = 0.0;
-                    let mut iter = 0;
-
-                    while zx * zx + zy * zy <= 4.0 && iter < max_iter {
-                        let xtemp = zx * zx - zy * zy + cx;
-                        zy = 2.0 * zx * zy + cy;
-                        zx = xtemp;
-                        iter += 1;
-                    }
-
-                    let color = if iter == max_iter {
-                        0x000000 // black
-                    } else {
-                        let intensity = (255 * iter / max_iter) as u8;
-                        (intensity as u32) << 16
-                    };
-
-                    let buf = color.to_le_bytes();
-                    buffer.extend_from_slice(&buf);
-                }
+            println!("\nListing /dev directory:");
+            for entry in File::list_directory("/dev").unwrap().iter() {
+                println!("{}", entry.full_name().iter().collect::<String>());
             }
-            guard.fwrite(vga, &buffer).unwrap();
-            guard.fflush(vga).unwrap();
-            guard.fclose(vga).unwrap();
+            println!();
+
+            let file = File::open("/dev/pata_pm_p0", OPEN_MODE_READ | OPEN_MODE_BINARY).unwrap();
+
+            let mut buf = [0u8; 2048];
+            let bytes_read = file.read(&mut buf).unwrap();
+            println!("Read {} bytes from /dev/pata_pm_p0 :", bytes_read);
+
+            // hexdump
+            hexdump(&buf[0..bytes_read as usize]);
+            println!();
         }
 
         kmain(obsiboot);
+    }
+}
+
+pub fn hexdump(data: &[u8]) {
+    let num_full_lines = data.len() / 16;
+    for i in 0..num_full_lines {
+        printf!("{:#06x}: ", i * 16);
+        let line = &data[i * 16..(i + 1) * 16];
+        for b in line.iter() {
+            printf!("{:02x} ", *b);
+        }
+        printf!(" | ");
+        for b in line.iter() {
+            let c = *b as char;
+            if c.is_ascii_graphic() {
+                printf!("{}", c);
+            } else {
+                printf!(".");
+            }
+        }
+        println!();
+    }
+
+    if data.len() % 16 != 0 {
+        printf!("{:#06x}: ", num_full_lines * 16);
+        let line = &data[num_full_lines * 16..];
+        for b in line.iter() {
+            printf!("{:02x} ", *b);
+        }
+        for _ in 0..(16 - line.len()) {
+            printf!("   ");
+        }
+        printf!(" | ");
+        for b in line.iter() {
+            let c = *b as char;
+            if c.is_ascii_graphic() {
+                printf!("{}", c);
+            } else {
+                printf!(".");
+            }
+        }
+        println!();
     }
 }
 

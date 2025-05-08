@@ -1,13 +1,15 @@
-use alloc::{boxed::Box, collections::BTreeSet, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeSet, format, string::String, sync::Arc, vec::Vec};
 use spin::RwLock;
 
 use crate::{
+    data::partition::{BlockDeviceRange, Partition, PartitionManager},
     drivers::{
         fs::virt::devfs::{fseek_helper, DevFs, DevFsDriver, DevFsHook, DevFsHookKind},
         pci::PciDevice,
         vfs::{
-            arcrwb_new_from_box, BlockDevice, FileStat, FileSystem, VfsError, VfsFile, VfsFileKind,
-            FLAG_PHYSICAL_BLOCK_DEVICE, OPEN_MODE_APPEND, OPEN_MODE_BINARY, OPEN_MODE_READ,
+            arcrwb_new_from_box, BlockDevice, FileStat, FileSystem, SubBlockDevice, VfsError,
+            VfsFile, VfsFileKind, FLAG_PARTITIONED_DEVICE, FLAG_PHYSICAL_BLOCK_DEVICE,
+            OPEN_MODE_APPEND, OPEN_MODE_BINARY, OPEN_MODE_READ,
         },
     },
     io::{inb, inw, outb, outw},
@@ -58,6 +60,8 @@ pub struct PataController {
 
     identify_data: [u16; 256],
     generation: u64,
+
+    partition_manager: PartitionManager,
 }
 
 impl PataController {
@@ -72,6 +76,7 @@ impl PataController {
             control_io,
             identify_data: [0; 256],
             generation: 0,
+            partition_manager: PartitionManager::new(),
         }
     }
 
@@ -247,8 +252,22 @@ impl PataController {
         PataDiskParams { sector_count }
     }
 
+    pub fn get_range(&self) -> BlockDeviceRange {
+        BlockDeviceRange {
+            start: 0,
+            end: self.get_disk_params().sector_count,
+        }
+    }
+
     pub fn size_bytes(&self) -> u64 {
         self.get_disk_params().sector_count * 512
+    }
+
+    fn outdated_partitions(&self) -> Option<Vec<Partition>> {
+        if self.partition_manager.get_generation() == self.generation {
+            return None;
+        }
+        Some(self.partition_manager.get_partitions())
     }
 }
 
@@ -311,6 +330,14 @@ impl BlockDevice for PataBlockDevice {
         512
     }
 
+    fn flush(&mut self) -> Result<(), VfsError> {
+        Ok(())
+    }
+
+    fn get_block_count(&self) -> u64 {
+        self.controller.read().size_bytes() / 512
+    }
+
     fn read_block(&self, lba: u64, buf: &mut [u8]) -> Result<u64, VfsError> {
         if buf.len() < 512 {
             return Err(VfsError::BadBufferSize);
@@ -348,6 +375,7 @@ struct PataFsFileHandle {
     last_sector: Option<u64>,
     sector_cache: [u8; 512],
     generation: u64,
+    disk_range: BlockDeviceRange,
 }
 
 impl DevFsDriver for PataDevfsDriver {
@@ -359,7 +387,7 @@ impl DevFsDriver for PataDevfsDriver {
         &mut self,
         dev_fs: &mut DevFs,
         pci_device: &PciDevice,
-        _device_id: usize,
+        device_id: usize,
     ) -> Result<(), VfsError> {
         if !self.handles_device(dev_fs, pci_device) {
             return Err(VfsError::ActionNotAllowed);
@@ -383,16 +411,65 @@ impl DevFsDriver for PataDevfsDriver {
             ),
         ] {
             let guard = controller.write();
-            if !guard.is_present() {
+            let reload_partitions = if let Some(last_parts) = guard.outdated_partitions() {
+                let sname = name.iter().collect::<String>();
+                for i in 0..last_parts.len() {
+                    dev_fs.remove_hook(&format!("{sname}_p{i}").chars().collect::<Vec<_>>());
+                }
+                if !guard.is_present() {
+                    dev_fs.remove_hook(&name);
+                    continue;
+                }
+                true
+            } else if !guard.is_present() {
                 dev_fs.remove_hook(&name);
                 continue;
+            } else {
+                false
+            };
+            let generation = guard.generation;
+            drop(guard);
+            let device: Arc<RwLock<Box<dyn BlockDevice>>> =
+                arcrwb_new_from_box(Box::new(PataBlockDevice {
+                    controller: controller.clone(),
+                }));
+            if reload_partitions {
+                let sname = name.iter().collect::<String>();
+                let mut manager = PartitionManager::new();
+                manager.reload_partitions(device.clone())?;
+
+                for (i, partition) in manager.get_partitions().iter().enumerate() {
+                    let name = format!("{sname}_p{i}");
+
+                    let range = partition.as_device_range();
+
+                    let device: Arc<RwLock<Box<dyn BlockDevice>>> = arcrwb_new_from_box(Box::new(
+                        SubBlockDevice::new(device.clone(), range.start, range.end),
+                    ));
+
+                    let file = VfsFile::new(
+                        VfsFileKind::BlockDevice { device },
+                        name.chars().collect(),
+                        0,
+                        dev_fs.os_id(),
+                        dev_fs.os_id(),
+                    );
+                    dev_fs.replace_hook(
+                        name.chars().collect(),
+                        self.driver_id(),
+                        file,
+                        DevFsHookKind::Device,
+                        generation,
+                        i as u64,
+                    );
+                }
+
+                let mut guard = controller.write();
+                guard.partition_manager = manager;
+                drop(guard);
             }
             let file = VfsFile::new(
-                VfsFileKind::BlockDevice {
-                    device: arcrwb_new_from_box(Box::new(PataBlockDevice {
-                        controller: controller.clone(),
-                    })),
-                },
+                VfsFileKind::BlockDevice { device },
                 name.clone(),
                 0,
                 dev_fs.os_id(),
@@ -403,7 +480,8 @@ impl DevFsDriver for PataDevfsDriver {
                 self.driver_id(),
                 file,
                 DevFsHookKind::Device,
-                guard.generation,
+                generation,
+                device_id as u64,
             );
         }
         Ok(())
@@ -432,9 +510,30 @@ impl DevFsDriver for PataDevfsDriver {
             return Err(VfsError::PathNotFound);
         };
 
-        if !controller.read().is_present() {
+        let guard = controller.read();
+        if !guard.is_present() {
             return Err(VfsError::PathNotFound);
         }
+
+        let disk_range = if hook.file.name().get(7..9) == Some(&['_', 'p']) {
+            if let Some(partition_i) = hook
+                .file
+                .name()
+                .get(9..)
+                .and_then(|s| s.iter().collect::<String>().parse::<usize>().ok())
+            {
+                let partition = guard
+                    .partition_manager
+                    .get_partition(partition_i)
+                    .ok_or(VfsError::PathNotFound)?;
+                partition.as_device_range()
+            } else {
+                return Err(VfsError::PathNotFound);
+            }
+        } else {
+            guard.get_range()
+        };
+        drop(guard);
 
         if mode & OPEN_MODE_APPEND != 0 {
             return Err(VfsError::InvalidOpenMode);
@@ -450,6 +549,7 @@ impl DevFsDriver for PataDevfsDriver {
             position: 0,
             sector_cache: [0; 512],
             generation: hook.generation,
+            disk_range,
         };
         let handle = dev_fs.alloc_file_handle(handle_data, hook);
 
@@ -525,11 +625,13 @@ impl DevFsDriver for PataDevfsDriver {
             return Err(VfsError::ActionNotAllowed);
         }
 
+        let range_size_bytes = (handle_data.disk_range.end - handle_data.disk_range.start) * 512;
+
         let mut bytes_read = 0;
         let to_read = buf
             .len()
-            .min((controller.size_bytes() - handle_data.position) as usize);
-        let mut sector = handle_data.position / 512;
+            .min((range_size_bytes - handle_data.position) as usize);
+        let mut sector = (handle_data.position / 512) + handle_data.disk_range.start;
 
         while bytes_read < to_read {
             if
@@ -551,7 +653,7 @@ impl DevFsDriver for PataDevfsDriver {
 
             handle_data.position += to_copy as u64;
             bytes_read += to_copy;
-            sector = handle_data.position / 512;
+            sector = (handle_data.position / 512) + handle_data.disk_range.start;
         }
         Ok(bytes_read as u64)
     }
@@ -579,11 +681,13 @@ impl DevFsDriver for PataDevfsDriver {
             return Err(VfsError::PathNotFound);
         }
 
+        let range_size_bytes = (handle_data.disk_range.end - handle_data.disk_range.start) * 512;
+
         let mut bytes_written = 0;
         let to_write = buf
             .len()
-            .min((controller.size_bytes() - handle_data.position) as usize);
-        let mut sector = handle_data.position / 512;
+            .min((range_size_bytes - handle_data.position) as usize);
+        let mut sector = (handle_data.position / 512) + handle_data.disk_range.start;
 
         while bytes_written < to_write {
             let sector_offset = (handle_data.position % 512) as usize;
@@ -609,7 +713,7 @@ impl DevFsDriver for PataDevfsDriver {
 
             handle_data.position += to_copy as u64;
             bytes_written += to_copy;
-            sector = handle_data.position / 512;
+            sector = (handle_data.position / 512) + handle_data.disk_range.start;
         }
         Ok(bytes_written as u64)
     }
@@ -644,7 +748,7 @@ impl DevFsDriver for PataDevfsDriver {
         Ok(handle_data.position)
     }
 
-    fn fstat(&mut self, dev_fs: &mut DevFs, handle: u64) -> Result<FileStat, VfsError> {
+    fn fstat(&mut self, dev_fs: &DevFs, handle: u64) -> Result<FileStat, VfsError> {
         if !self.handles.contains(&handle) {
             return Err(VfsError::BadHandle);
         }
@@ -675,7 +779,7 @@ impl DevFsDriver for PataDevfsDriver {
             group_id: 0,
             created_at: 0,
             modified_at: 0,
-            flags: FLAG_PHYSICAL_BLOCK_DEVICE,
+            flags: FLAG_PHYSICAL_BLOCK_DEVICE | FLAG_PARTITIONED_DEVICE,
         })
     }
 }

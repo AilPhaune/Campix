@@ -342,7 +342,7 @@ impl DevFsDriver for VgaDriver {
         &mut self,
         dev_fs: &mut DevFs,
         pci_device: &PciDevice,
-        _device_id: usize,
+        device_id: usize,
     ) -> Result<(), VfsError> {
         if !self.handles_device(dev_fs, pci_device) {
             return Err(VfsError::ActionNotAllowed);
@@ -362,6 +362,7 @@ impl DevFsDriver for VgaDriver {
             file,
             DevFsHookKind::Device,
             0,
+            device_id as u64,
         );
         Ok(())
     }
@@ -403,7 +404,7 @@ impl DevFsDriver for VgaDriver {
         Ok(())
     }
 
-    fn fstat(&mut self, _dev_fs: &mut DevFs, handle: u64) -> Result<FileStat, VfsError> {
+    fn fstat(&mut self, _dev_fs: &DevFs, handle: u64) -> Result<FileStat, VfsError> {
         if !self.handles.contains(&handle) {
             return Err(VfsError::ActionNotAllowed);
         }

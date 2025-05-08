@@ -1,4 +1,4 @@
-use core::any::Any;
+use core::{any::Any, fmt::Debug};
 
 use alloc::{
     boxed::Box,
@@ -49,13 +49,25 @@ pub enum VfsError {
     DriverError(Box<dyn core::fmt::Debug>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum VfsFileKind {
     File,
     Directory,
     BlockDevice { device: Arcrwb<dyn BlockDevice> },
     CharacterDevice { device: Arcrwb<dyn CharacterDevice> },
     MountPoint { mounted_fs: Arcrwb<dyn FileSystem> },
+}
+
+impl Debug for VfsFileKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            VfsFileKind::File => write!(f, "File"),
+            VfsFileKind::Directory => write!(f, "Directory"),
+            VfsFileKind::BlockDevice { .. } => write!(f, "BlockDevice"),
+            VfsFileKind::CharacterDevice { .. } => write!(f, "CharacterDevice"),
+            VfsFileKind::MountPoint { .. } => write!(f, "MountPoint"),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -151,8 +163,10 @@ impl VfsFile {
 pub trait BlockDevice: Send + Sync + core::fmt::Debug + AsAny {
     fn get_generation(&self) -> u64;
     fn get_block_size(&self) -> u64;
+    fn get_block_count(&self) -> u64;
     fn read_block(&self, lba: u64, buf: &mut [u8]) -> Result<u64, VfsError>;
     fn write_block(&mut self, lba: u64, buf: &[u8]) -> Result<u64, VfsError>;
+    fn flush(&mut self) -> Result<(), VfsError>;
 }
 
 pub trait CharacterDevice: Send + Sync + core::fmt::Debug + AsAny {
@@ -166,6 +180,146 @@ pub trait CharacterDevice: Send + Sync + core::fmt::Debug + AsAny {
 pub trait AsAny {
     fn as_any_mut(&mut self) -> &mut dyn Any;
     fn as_any(&self) -> &dyn Any;
+}
+
+#[derive(Debug, Clone)]
+pub struct SubBlockDevice {
+    device: Arcrwb<dyn BlockDevice>,
+    generation: u64,
+    begin_block: u64,
+    end_block: u64,
+}
+
+impl SubBlockDevice {
+    pub fn new(device: Arcrwb<dyn BlockDevice>, begin_block: u64, end_block: u64) -> Self {
+        let generation = device.read().get_generation();
+        Self {
+            device,
+            generation,
+            begin_block,
+            end_block,
+        }
+    }
+}
+
+impl BlockDevice for SubBlockDevice {
+    fn get_generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn get_block_size(&self) -> u64 {
+        self.device.read().get_block_size()
+    }
+
+    fn get_block_count(&self) -> u64 {
+        self.end_block - self.begin_block
+    }
+
+    fn read_block(&self, lba: u64, buf: &mut [u8]) -> Result<u64, VfsError> {
+        if lba >= self.get_block_count() {
+            return Err(VfsError::OutOfBounds);
+        }
+        self.device.read().read_block(lba, buf)
+    }
+
+    fn write_block(&mut self, lba: u64, buf: &[u8]) -> Result<u64, VfsError> {
+        if lba >= self.get_block_count() {
+            return Err(VfsError::OutOfBounds);
+        }
+        let mut guard = self.device.write();
+        if guard.get_generation() != self.generation {
+            return Err(VfsError::ActionNotAllowed);
+        }
+        guard.write_block(lba, buf)
+    }
+
+    fn flush(&mut self) -> Result<(), VfsError> {
+        self.device.write().flush()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockDeviceAsCharacterDevice {
+    device: Arcrwb<dyn BlockDevice>,
+}
+
+impl BlockDeviceAsCharacterDevice {
+    pub fn new(device: Arcrwb<dyn BlockDevice>) -> Self {
+        Self { device }
+    }
+}
+
+impl CharacterDevice for BlockDeviceAsCharacterDevice {
+    fn get_generation(&self) -> u64 {
+        self.device.read().get_generation()
+    }
+
+    fn get_size(&self) -> u64 {
+        let guard = self.device.read();
+        guard.get_block_count() * guard.get_block_size()
+    }
+
+    fn flush(&mut self) -> Result<(), VfsError> {
+        self.device.write().flush()
+    }
+
+    fn read_chars(&self, mut offset: u64, buf: &mut [u8]) -> Result<u64, VfsError> {
+        let to_read = (buf.len() as u64).min(self.get_size() - offset) as usize;
+        let mut read: usize = 0;
+
+        let guard = self.device.read();
+
+        let block_size = guard.get_block_size() as usize;
+        let mut block = alloc::vec![0u8; block_size];
+
+        while read < to_read {
+            let lba = offset / guard.get_block_size();
+            let pos = (offset % guard.get_block_size()) as usize;
+
+            let rem_read = to_read - read;
+            let max_read_sector = block_size - pos;
+            let to_read_sector = rem_read.min(max_read_sector);
+
+            guard.read_block(lba, &mut block)?;
+            buf[read..read + to_read_sector].copy_from_slice(&block[pos..pos + to_read_sector]);
+
+            read += to_read_sector;
+            offset += to_read_sector as u64;
+        }
+        Ok(read as u64)
+    }
+
+    fn write_chars(&mut self, mut offset: u64, buf: &[u8]) -> Result<u64, VfsError> {
+        let to_write = (buf.len() as u64).min(self.get_size() - offset) as usize;
+        let mut write: usize = 0;
+
+        let mut guard = self.device.write();
+
+        let block_size = guard.get_block_size() as usize;
+        let mut block = alloc::vec![0u8; block_size];
+
+        while write < to_write {
+            let lba = offset / guard.get_block_size();
+            let pos = (offset % guard.get_block_size()) as usize;
+
+            let rem_write = to_write - write;
+            let max_write_sector = block_size - pos;
+            let to_write_sector = rem_write.min(max_write_sector);
+
+            if to_write_sector != block_size {
+                guard.read_block(lba, &mut block)?;
+                block[pos..pos + to_write_sector]
+                    .copy_from_slice(&buf[write..write + to_write_sector]);
+                guard.write_block(lba, &block)?;
+            } else {
+                guard.write_block(lba, &buf[write..write + to_write_sector])?;
+            }
+
+            write += to_write_sector;
+            offset += to_write_sector as u64;
+        }
+        Ok(write as u64)
+    }
 }
 
 pub const OPEN_MODE_READ: u64 = 1 << 0;
@@ -188,6 +342,7 @@ pub const FLAG_PHYSICAL_BLOCK_DEVICE: u64 = 1 << 4;
 pub const FLAG_VIRTUAL_BLOCK_DEVICE: u64 = 1 << 5;
 pub const FLAG_PHYSICAL_CHARACTER_DEVICE: u64 = 1 << 6;
 pub const FLAG_VIRTUAL_CHARACTER_DEVICE: u64 = 1 << 7;
+pub const FLAG_PARTITIONED_DEVICE: u64 = 1 << 8;
 
 #[derive(Debug)]
 pub struct FileStat {
@@ -296,7 +451,7 @@ pub trait FileSystem: Send + Sync + core::fmt::Debug + AsAny {
     fn fsync(&mut self, handle: u64) -> Result<(), VfsError>;
 
     /// Gets stats of a file
-    fn fstat(&mut self, handle: u64) -> Result<FileStat, VfsError>;
+    fn fstat(&self, handle: u64) -> Result<FileStat, VfsError>;
 }
 
 pub struct PathSplitter<'a> {
@@ -681,7 +836,7 @@ impl FileSystem for Vfs {
         Err(VfsError::ActionNotAllowed)
     }
 
-    fn fstat(&mut self, _handle: u64) -> Result<FileStat, VfsError> {
+    fn fstat(&self, _handle: u64) -> Result<FileStat, VfsError> {
         Err(VfsError::ActionNotAllowed)
     }
 

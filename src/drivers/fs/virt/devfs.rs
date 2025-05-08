@@ -8,7 +8,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use spin::rwlock::RwLock;
+use spin::RwLock;
 
 use crate::drivers::{
     disk::init_disk_drivers,
@@ -77,7 +77,7 @@ pub trait DevFsDriver: Send + Sync + Debug + AsAny {
     fn fwrite(&mut self, dev_fs: &mut DevFs, handle: u64, buf: &[u8]) -> Result<u64, VfsError>;
     fn fflush(&mut self, dev_fs: &mut DevFs, handle: u64) -> Result<(), VfsError>;
     fn fsync(&mut self, dev_fs: &mut DevFs, handle: u64) -> Result<(), VfsError>;
-    fn fstat(&mut self, dev_fs: &mut DevFs, handle: u64) -> Result<FileStat, VfsError>;
+    fn fstat(&mut self, dev_fs: &DevFs, handle: u64) -> Result<FileStat, VfsError>;
     fn fseek(
         &mut self,
         dev_fs: &mut DevFs,
@@ -105,6 +105,7 @@ pub struct DevFsHook {
     pub file: VfsFile,
     pub kind: DevFsHookKind,
     pub generation: u64,
+    pub device_id: u64,
 }
 
 #[derive(Debug)]
@@ -148,6 +149,7 @@ impl DevFs {
         file: VfsFile,
         kind: DevFsHookKind,
         generation: u64,
+        device_id: u64,
     ) -> Option<Arc<DevFsHook>> {
         let driver = self.drivers.get(&driver)?.clone();
         let hook = Arc::new(DevFsHook {
@@ -155,6 +157,7 @@ impl DevFs {
             file,
             kind,
             generation,
+            device_id,
         });
         self.hooks.insert(path, hook.clone())
     }
@@ -417,19 +420,24 @@ impl FileSystem for DevFs {
             Entry::Vacant(_) => Err(VfsError::ActionNotAllowed),
             Entry::Occupied(o) => {
                 let driver = o.get().driver.clone();
+                let device_id = o.get().device_id as usize;
                 let mut wguard = driver.write();
                 (*wguard).fsync(self, handle)?;
-                // TODO: update device files
+                let device = *self
+                    .devices
+                    .get(device_id)
+                    .ok_or(VfsError::ActionNotAllowed)?;
+                (*wguard).refresh_device_hooks(self, &device, device_id)?;
                 Ok(())
             }
         }
     }
 
-    fn fstat(&mut self, handle: u64) -> Result<FileStat, VfsError> {
-        match self.handles.entry(handle) {
-            Entry::Vacant(_) => Err(VfsError::ActionNotAllowed),
-            Entry::Occupied(o) => {
-                let driver = o.get().driver.clone();
+    fn fstat(&self, handle: u64) -> Result<FileStat, VfsError> {
+        match self.handles.get(&handle) {
+            None => Err(VfsError::ActionNotAllowed),
+            Some(d) => {
+                let driver = d.driver.clone();
                 let mut wguard = driver.write();
                 (*wguard).fstat(self, handle)
             }
