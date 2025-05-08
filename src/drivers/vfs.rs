@@ -149,12 +149,14 @@ impl VfsFile {
 }
 
 pub trait BlockDevice: Send + Sync + core::fmt::Debug + AsAny {
+    fn get_generation(&self) -> u64;
     fn get_block_size(&self) -> u64;
     fn read_block(&self, lba: u64, buf: &mut [u8]) -> Result<u64, VfsError>;
     fn write_block(&mut self, lba: u64, buf: &[u8]) -> Result<u64, VfsError>;
 }
 
 pub trait CharacterDevice: Send + Sync + core::fmt::Debug + AsAny {
+    fn get_generation(&self) -> u64;
     fn get_size(&self) -> u64;
     fn read_chars(&self, offset: u64, buf: &mut [u8]) -> Result<u64, VfsError>;
     fn write_chars(&mut self, offset: u64, buf: &[u8]) -> Result<u64, VfsError>;
@@ -166,10 +168,10 @@ pub trait AsAny {
     fn as_any(&self) -> &dyn Any;
 }
 
-pub const FLAG_READ: u64 = 1 << 0;
-pub const FLAG_WRITE: u64 = 1 << 1;
-pub const FLAG_APPEND: u64 = 1 << 2;
-pub const FLAG_BINARY: u64 = 1 << 3;
+pub const OPEN_MODE_READ: u64 = 1 << 0;
+pub const OPEN_MODE_WRITE: u64 = 1 << 1;
+pub const OPEN_MODE_APPEND: u64 = 1 << 2;
+pub const OPEN_MODE_BINARY: u64 = 1 << 3;
 
 #[derive(Debug, Clone, Copy)]
 pub enum SeekPosition {
@@ -177,6 +179,15 @@ pub enum SeekPosition {
     FromCurrent(i64),
     FromEnd(u64),
 }
+
+pub const FLAG_VIRTUAL: u64 = 1 << 0;
+pub const FLAG_READ_ONLY: u64 = 1 << 1;
+pub const FLAG_HIDDEN: u64 = 1 << 2;
+pub const FLAG_SYSTEM: u64 = 1 << 3;
+pub const FLAG_PHYSICAL_BLOCK_DEVICE: u64 = 1 << 4;
+pub const FLAG_VIRTUAL_BLOCK_DEVICE: u64 = 1 << 5;
+pub const FLAG_PHYSICAL_CHARACTER_DEVICE: u64 = 1 << 6;
+pub const FLAG_VIRTUAL_CHARACTER_DEVICE: u64 = 1 << 7;
 
 #[derive(Debug)]
 pub struct FileStat {
@@ -188,6 +199,7 @@ pub struct FileStat {
     pub is_symlink: bool,
     pub owner_id: u32,
     pub group_id: u32,
+    pub flags: u64,
 }
 
 pub trait FileSystem: Send + Sync + core::fmt::Debug + AsAny {
@@ -279,6 +291,9 @@ pub trait FileSystem: Send + Sync + core::fmt::Debug + AsAny {
 
     /// Flushes a file
     fn fflush(&mut self, handle: u64) -> Result<(), VfsError>;
+
+    /// Synchronizes a file
+    fn fsync(&mut self, handle: u64) -> Result<(), VfsError>;
 
     /// Gets stats of a file
     fn fstat(&mut self, handle: u64) -> Result<FileStat, VfsError>;
@@ -398,11 +413,11 @@ impl Vfs {
         self.os_id_count
     }
 
-    pub fn get_os_by_id(&self, id: u64) -> Option<Arcrwb<dyn FileSystem>> {
+    pub fn get_fs_by_id(&self, id: u64) -> Option<Arcrwb<dyn FileSystem>> {
         self.fs_by_id.read().get(&id).cloned()
     }
 
-    pub fn get_os_by_name(&self, name: &[char]) -> Option<Arcrwb<dyn FileSystem>> {
+    pub fn get_fs_by_name(&self, name: &[char]) -> Option<Arcrwb<dyn FileSystem>> {
         self.fs_by_name.read().get(name).cloned()
     }
 
@@ -671,6 +686,10 @@ impl FileSystem for Vfs {
     }
 
     fn fseek(&mut self, _handle: u64, _position: SeekPosition) -> Result<u64, VfsError> {
+        Err(VfsError::ActionNotAllowed)
+    }
+
+    fn fsync(&mut self, _handle: u64) -> Result<(), VfsError> {
         Err(VfsError::ActionNotAllowed)
     }
 }

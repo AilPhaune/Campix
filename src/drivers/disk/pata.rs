@@ -3,11 +3,11 @@ use spin::RwLock;
 
 use crate::{
     drivers::{
-        fs::virt::devfs::{fseek_helper, DevFS, DevFsDriver},
+        fs::virt::devfs::{fseek_helper, DevFs, DevFsDriver, DevFsHook, DevFsHookKind},
         pci::PciDevice,
         vfs::{
             arcrwb_new_from_box, BlockDevice, FileStat, FileSystem, VfsError, VfsFile, VfsFileKind,
-            FLAG_APPEND, FLAG_BINARY, FLAG_READ,
+            FLAG_PHYSICAL_BLOCK_DEVICE, OPEN_MODE_APPEND, OPEN_MODE_BINARY, OPEN_MODE_READ,
         },
     },
     io::{inb, inw, outb, outw},
@@ -57,6 +57,7 @@ pub struct PataController {
     control_io: u16, // Control port (like 0x3F6 or 0x376)
 
     identify_data: [u16; 256],
+    generation: u64,
 }
 
 impl PataController {
@@ -70,6 +71,7 @@ impl PataController {
             base_io,
             control_io,
             identify_data: [0; 256],
+            generation: 0,
         }
     }
 
@@ -126,6 +128,10 @@ impl PataController {
             }
         }
         false
+    }
+
+    pub fn get_generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn read_sector(&self, lba: u64, buffer: &mut [u8; 512]) -> Result<(), PataErrtype> {
@@ -292,9 +298,15 @@ impl PataDevfsDriver {
 }
 
 #[derive(Debug)]
-struct PataBlockDevice(Arc<RwLock<PataController>>);
+struct PataBlockDevice {
+    controller: Arc<RwLock<PataController>>,
+}
 
 impl BlockDevice for PataBlockDevice {
+    fn get_generation(&self) -> u64 {
+        self.controller.read().get_generation()
+    }
+
     fn get_block_size(&self) -> u64 {
         512
     }
@@ -304,7 +316,7 @@ impl BlockDevice for PataBlockDevice {
             return Err(VfsError::BadBufferSize);
         }
         let mut data: [u8; 512] = [0; 512];
-        self.0
+        self.controller
             .read()
             .read_sector(lba, &mut data)
             .map_err(|e| VfsError::DriverError(Box::new(e)))?;
@@ -318,7 +330,7 @@ impl BlockDevice for PataBlockDevice {
         }
         let mut data: [u8; 512] = [0; 512];
         data.copy_from_slice(buf);
-        self.0
+        self.controller
             .write()
             .write_sector(lba, &data)
             .map_err(|e| VfsError::DriverError(Box::new(e)))?;
@@ -335,6 +347,7 @@ struct PataFsFileHandle {
     position: u64,
     last_sector: Option<u64>,
     sector_cache: [u8; 512],
+    generation: u64,
 }
 
 impl DevFsDriver for PataDevfsDriver {
@@ -342,63 +355,78 @@ impl DevFsDriver for PataDevfsDriver {
         PATA
     }
 
-    fn get_device_files(
-        &self,
-        devfs: &mut DevFS,
-        device: &PciDevice,
-    ) -> Result<Vec<VfsFile>, VfsError> {
-        if !self.handles_device(devfs, device) {
+    fn refresh_device_hooks(
+        &mut self,
+        dev_fs: &mut DevFs,
+        pci_device: &PciDevice,
+        _device_id: usize,
+    ) -> Result<(), VfsError> {
+        if !self.handles_device(dev_fs, pci_device) {
             return Err(VfsError::ActionNotAllowed);
         }
-        let mut files: Vec<(Vec<char>, Arc<RwLock<PataController>>)> = Vec::new();
-        if self.controller_pm.read().is_present() {
-            files.push((
+        for (name, controller) in [
+            (
                 "pata_pm".chars().collect::<Vec<_>>(),
                 self.controller_pm.clone(),
-            ));
-        }
-        if self.controller_ps.read().is_present() {
-            files.push((
+            ),
+            (
                 "pata_ps".chars().collect::<Vec<_>>(),
                 self.controller_ps.clone(),
-            ));
-        }
-        if self.controller_sm.read().is_present() {
-            files.push((
+            ),
+            (
                 "pata_sm".chars().collect::<Vec<_>>(),
                 self.controller_sm.clone(),
-            ));
-        }
-        if self.controller_ss.read().is_present() {
-            files.push((
+            ),
+            (
                 "pata_ss".chars().collect::<Vec<_>>(),
                 self.controller_ss.clone(),
-            ));
+            ),
+        ] {
+            let guard = controller.write();
+            if !guard.is_present() {
+                dev_fs.remove_hook(&name);
+                continue;
+            }
+            let file = VfsFile::new(
+                VfsFileKind::BlockDevice {
+                    device: arcrwb_new_from_box(Box::new(PataBlockDevice {
+                        controller: controller.clone(),
+                    })),
+                },
+                name.clone(),
+                0,
+                dev_fs.os_id(),
+                dev_fs.os_id(),
+            );
+            dev_fs.replace_hook(
+                name,
+                self.driver_id(),
+                file,
+                DevFsHookKind::Device,
+                guard.generation,
+            );
         }
-
-        Ok(files
-            .iter()
-            .map(|(name, controller)| {
-                let block_device = VfsFileKind::BlockDevice {
-                    device: arcrwb_new_from_box(Box::new(PataBlockDevice(controller.clone()))),
-                };
-                VfsFile::new(block_device, name.clone(), 0, devfs.os_id(), devfs.os_id())
-            })
-            .collect::<Vec<_>>())
+        Ok(())
     }
 
-    fn handles_device(&self, _dev_fs: &mut DevFS, pci_device: &PciDevice) -> bool {
+    fn handles_device(&self, _dev_fs: &mut DevFs, pci_device: &PciDevice) -> bool {
         self.pci_device == *pci_device
     }
 
-    fn fopen(&mut self, dev_fs: &mut DevFS, file: &VfsFile, mode: u64) -> Result<u64, VfsError> {
-        let controller = if file.name() == &['p', 'a', 't', 'a', '_', 'p', 'm'] {
+    fn fopen(
+        &mut self,
+        dev_fs: &mut DevFs,
+        hook: Arc<DevFsHook>,
+        mode: u64,
+    ) -> Result<u64, VfsError> {
+        let controller = if hook.file.name().get(0..7) == Some(&['p', 'a', 't', 'a', '_', 'p', 'm'])
+        {
             &self.controller_pm
-        } else if file.name() == &['p', 'a', 't', 'a', '_', 'p', 's'] {
+        } else if hook.file.name().get(0..7) == Some(&['p', 'a', 't', 'a', '_', 'p', 's']) {
             &self.controller_ps
-        } else if file.name() == &['p', 'a', 't', 'a', '_', 's', 'm'] {
+        } else if hook.file.name().get(0..7) == Some(&['p', 'a', 't', 'a', '_', 's', 'm']) {
             &self.controller_sm
-        } else if file.name() == &['p', 'a', 't', 'a', '_', 's', 's'] {
+        } else if hook.file.name().get(0..7) == Some(&['p', 'a', 't', 'a', '_', 's', 's']) {
             &self.controller_ss
         } else {
             return Err(VfsError::PathNotFound);
@@ -408,10 +436,10 @@ impl DevFsDriver for PataDevfsDriver {
             return Err(VfsError::PathNotFound);
         }
 
-        if mode & FLAG_APPEND != 0 {
+        if mode & OPEN_MODE_APPEND != 0 {
             return Err(VfsError::InvalidOpenMode);
         }
-        if mode & FLAG_BINARY == 0 {
+        if mode & OPEN_MODE_BINARY == 0 {
             return Err(VfsError::InvalidOpenMode);
         }
 
@@ -421,24 +449,63 @@ impl DevFsDriver for PataDevfsDriver {
             last_sector: None,
             position: 0,
             sector_cache: [0; 512],
+            generation: hook.generation,
         };
-        let handle = dev_fs.alloc_file_handle(handle_data, self.driver_id());
+        let handle = dev_fs.alloc_file_handle(handle_data, hook);
 
         self.handles.insert(handle);
         Ok(handle)
     }
 
-    fn fclose(&mut self, dev_fs: &mut DevFS, handle: u64) -> Result<(), VfsError> {
+    fn fclose(&mut self, dev_fs: &mut DevFs, handle: u64) -> Result<(), VfsError> {
         self.handles.remove(&handle);
         dev_fs.dealloc_file_handle::<PataFsFileHandle>(handle);
         Ok(())
     }
 
-    fn fflush(&mut self, _dev_fs: &mut DevFS, _handle: u64) -> Result<(), VfsError> {
+    fn fflush(&mut self, dev_fs: &mut DevFs, handle: u64) -> Result<(), VfsError> {
+        if !self.handles.contains(&handle) {
+            return Err(VfsError::BadHandle);
+        }
+        let handle_data = unsafe {
+            &mut *(dev_fs
+                .get_handle_data::<PataFsFileHandle>(handle)
+                .ok_or(VfsError::BadHandle)?)
+        };
+        let controller = handle_data.controller.read();
+        if controller.generation != handle_data.generation {
+            return Err(VfsError::BadHandle);
+        }
+
         Ok(())
     }
 
-    fn fread(&mut self, dev_fs: &mut DevFS, handle: u64, buf: &mut [u8]) -> Result<u64, VfsError> {
+    fn fsync(&mut self, dev_fs: &mut DevFs, handle: u64) -> Result<(), VfsError> {
+        if !self.handles.contains(&handle) {
+            return Err(VfsError::BadHandle);
+        }
+
+        let handle_data = unsafe {
+            &mut *(dev_fs
+                .get_handle_data::<PataFsFileHandle>(handle)
+                .ok_or(VfsError::BadHandle)?)
+        };
+        let mut controller = handle_data.controller.write();
+        if controller.generation != handle_data.generation {
+            return Err(VfsError::BadHandle);
+        }
+
+        if !controller.is_present() {
+            return Err(VfsError::PathNotFound);
+        }
+
+        controller.generation += 1;
+        handle_data.generation = controller.generation;
+
+        Ok(())
+    }
+
+    fn fread(&mut self, dev_fs: &mut DevFs, handle: u64, buf: &mut [u8]) -> Result<u64, VfsError> {
         if !self.handles.contains(&handle) {
             return Err(VfsError::BadHandle);
         }
@@ -454,7 +521,7 @@ impl DevFsDriver for PataDevfsDriver {
             return Err(VfsError::PathNotFound);
         }
 
-        if handle_data.mode & FLAG_READ == 0 {
+        if handle_data.mode & OPEN_MODE_READ == 0 {
             return Err(VfsError::ActionNotAllowed);
         }
 
@@ -489,7 +556,7 @@ impl DevFsDriver for PataDevfsDriver {
         Ok(bytes_read as u64)
     }
 
-    fn fwrite(&mut self, dev_fs: &mut DevFS, handle: u64, buf: &[u8]) -> Result<u64, VfsError> {
+    fn fwrite(&mut self, dev_fs: &mut DevFs, handle: u64, buf: &[u8]) -> Result<u64, VfsError> {
         if !self.handles.contains(&handle) {
             return Err(VfsError::BadHandle);
         }
@@ -499,11 +566,14 @@ impl DevFsDriver for PataDevfsDriver {
                 .get_handle_data::<PataFsFileHandle>(handle)
                 .ok_or(VfsError::BadHandle)?)
         };
-        if (handle_data.mode & FLAG_READ) == 0 {
+        if (handle_data.mode & OPEN_MODE_READ) == 0 {
             return Err(VfsError::ActionNotAllowed);
         }
 
         let mut controller = handle_data.controller.write();
+        if controller.generation != handle_data.generation {
+            return Err(VfsError::BadHandle);
+        }
 
         if !controller.is_present() {
             return Err(VfsError::PathNotFound);
@@ -546,7 +616,7 @@ impl DevFsDriver for PataDevfsDriver {
 
     fn fseek(
         &mut self,
-        dev_fs: &mut DevFS,
+        dev_fs: &mut DevFs,
         handle: u64,
         position: crate::drivers::vfs::SeekPosition,
     ) -> Result<u64, VfsError> {
@@ -574,7 +644,7 @@ impl DevFsDriver for PataDevfsDriver {
         Ok(handle_data.position)
     }
 
-    fn fstat(&mut self, dev_fs: &mut DevFS, handle: u64) -> Result<FileStat, VfsError> {
+    fn fstat(&mut self, dev_fs: &mut DevFs, handle: u64) -> Result<FileStat, VfsError> {
         if !self.handles.contains(&handle) {
             return Err(VfsError::BadHandle);
         }
@@ -586,6 +656,9 @@ impl DevFsDriver for PataDevfsDriver {
         };
         let len = {
             let controller = handle_data.controller.read();
+            if controller.generation != handle_data.generation {
+                return Err(VfsError::BadHandle);
+            }
             if !controller.is_present() {
                 return Err(VfsError::PathNotFound);
             }
@@ -602,6 +675,7 @@ impl DevFsDriver for PataDevfsDriver {
             group_id: 0,
             created_at: 0,
             modified_at: 0,
+            flags: FLAG_PHYSICAL_BLOCK_DEVICE,
         })
     }
 }

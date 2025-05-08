@@ -1,6 +1,6 @@
 use core::{alloc::Layout, panic};
 
-use alloc::{alloc::alloc_zeroed, boxed::Box, collections::BTreeSet, vec::Vec};
+use alloc::{alloc::alloc_zeroed, boxed::Box, collections::BTreeSet, sync::Arc};
 use spin::RwLock;
 
 use crate::{
@@ -9,11 +9,12 @@ use crate::{
 };
 
 use super::{
-    fs::virt::devfs::{fseek_helper, DevFS, DevFsDriver},
+    fs::virt::devfs::{fseek_helper, DevFs, DevFsDriver, DevFsHook, DevFsHookKind},
     pci::PciDevice,
     vfs::{
         arcrwb_new_from_box, Arcrwb, CharacterDevice, FileStat, FileSystem, VfsError, VfsFile,
-        VfsFileKind, FLAG_APPEND, FLAG_BINARY, FLAG_READ, FLAG_WRITE,
+        VfsFileKind, FLAG_SYSTEM, FLAG_VIRTUAL_CHARACTER_DEVICE, OPEN_MODE_APPEND,
+        OPEN_MODE_BINARY, OPEN_MODE_READ, OPEN_MODE_WRITE,
     },
 };
 
@@ -250,6 +251,10 @@ impl VgaCharDevice {
 }
 
 impl CharacterDevice for VgaCharDevice {
+    fn get_generation(&self) -> u64 {
+        0
+    }
+
     fn get_size(&self) -> u64 {
         self.double_buffer_size
     }
@@ -325,7 +330,7 @@ impl VgaDriver {
 const VGA: u64 = u64::from_be_bytes([0, 0, 0, 0, 0, b'v', b'g', b'a']);
 
 impl DevFsDriver for VgaDriver {
-    fn handles_device(&self, _dev_fs: &mut DevFS, pci_device: &PciDevice) -> bool {
+    fn handles_device(&self, _dev_fs: &mut DevFs, pci_device: &PciDevice) -> bool {
         pci_device.class == 0x03 && pci_device.subclass == 0x00
     }
 
@@ -333,27 +338,41 @@ impl DevFsDriver for VgaDriver {
         VGA
     }
 
-    fn get_device_files(
-        &self,
-        dev_fs: &mut DevFS,
+    fn refresh_device_hooks(
+        &mut self,
+        dev_fs: &mut DevFs,
         pci_device: &PciDevice,
-    ) -> Result<Vec<VfsFile>, VfsError> {
+        _device_id: usize,
+    ) -> Result<(), VfsError> {
         if !self.handles_device(dev_fs, pci_device) {
             return Err(VfsError::ActionNotAllowed);
         }
-        Ok(alloc::vec![VfsFile::new(
+        let file = VfsFile::new(
             VfsFileKind::CharacterDevice {
-                device: self.device.clone()
+                device: self.device.clone(),
             },
             alloc::vec!['v', 'g', 'a'],
             0,
             dev_fs.os_id(),
             dev_fs.os_id(),
-        )])
+        );
+        dev_fs.replace_hook(
+            "vga".chars().collect(),
+            self.driver_id(),
+            file,
+            DevFsHookKind::Device,
+            0,
+        );
+        Ok(())
     }
 
-    fn fopen(&mut self, dev_fs: &mut DevFS, file: &VfsFile, mode: u64) -> Result<u64, VfsError> {
-        if file.name() != &['v', 'g', 'a'] {
+    fn fopen(
+        &mut self,
+        dev_fs: &mut DevFs,
+        hook: Arc<DevFsHook>,
+        mode: u64,
+    ) -> Result<u64, VfsError> {
+        if hook.file.name() != &['v', 'g', 'a'] {
             return Err(VfsError::PathNotFound);
         }
 
@@ -363,19 +382,19 @@ impl DevFsDriver for VgaDriver {
             position: 0,
         };
 
-        if mode & FLAG_APPEND != 0 {
+        if mode & OPEN_MODE_APPEND != 0 {
             return Err(VfsError::InvalidOpenMode);
         }
-        if mode & FLAG_BINARY == 0 {
+        if mode & OPEN_MODE_BINARY == 0 {
             return Err(VfsError::InvalidOpenMode);
         }
 
-        let handle = dev_fs.alloc_file_handle::<VgaFsFileHandle>(handle_data, self.driver_id());
+        let handle = dev_fs.alloc_file_handle::<VgaFsFileHandle>(handle_data, hook);
         self.handles.insert(handle);
         Ok(handle)
     }
 
-    fn fclose(&mut self, dev_fs: &mut DevFS, handle: u64) -> Result<(), VfsError> {
+    fn fclose(&mut self, dev_fs: &mut DevFs, handle: u64) -> Result<(), VfsError> {
         if !self.handles.contains(&handle) {
             return Err(VfsError::ActionNotAllowed);
         }
@@ -384,7 +403,7 @@ impl DevFsDriver for VgaDriver {
         Ok(())
     }
 
-    fn fstat(&mut self, _dev_fs: &mut DevFS, handle: u64) -> Result<FileStat, VfsError> {
+    fn fstat(&mut self, _dev_fs: &mut DevFs, handle: u64) -> Result<FileStat, VfsError> {
         if !self.handles.contains(&handle) {
             return Err(VfsError::ActionNotAllowed);
         }
@@ -397,12 +416,13 @@ impl DevFsDriver for VgaDriver {
             group_id: 0,
             created_at: 0,
             modified_at: 0,
+            flags: FLAG_VIRTUAL_CHARACTER_DEVICE | FLAG_SYSTEM,
         })
     }
 
     fn fseek(
         &mut self,
-        dev_fs: &mut DevFS,
+        dev_fs: &mut DevFs,
         handle: u64,
         position: super::vfs::SeekPosition,
     ) -> Result<u64, VfsError> {
@@ -421,7 +441,7 @@ impl DevFsDriver for VgaDriver {
         Ok(handle_data.position)
     }
 
-    fn fread(&mut self, dev_fs: &mut DevFS, handle: u64, buf: &mut [u8]) -> Result<u64, VfsError> {
+    fn fread(&mut self, dev_fs: &mut DevFs, handle: u64, buf: &mut [u8]) -> Result<u64, VfsError> {
         if !self.handles.contains(&handle) {
             return Err(VfsError::BadHandle);
         }
@@ -431,7 +451,7 @@ impl DevFsDriver for VgaDriver {
                 .ok_or(VfsError::BadHandle)?)
         };
 
-        if handle_data.mode & FLAG_READ == 0 {
+        if handle_data.mode & OPEN_MODE_READ == 0 {
             return Err(VfsError::ActionNotAllowed);
         }
 
@@ -443,7 +463,7 @@ impl DevFsDriver for VgaDriver {
         Ok(bytes_read)
     }
 
-    fn fwrite(&mut self, dev_fs: &mut DevFS, handle: u64, buf: &[u8]) -> Result<u64, VfsError> {
+    fn fwrite(&mut self, dev_fs: &mut DevFs, handle: u64, buf: &[u8]) -> Result<u64, VfsError> {
         if !self.handles.contains(&handle) {
             return Err(VfsError::BadHandle);
         }
@@ -453,7 +473,7 @@ impl DevFsDriver for VgaDriver {
                 .ok_or(VfsError::BadHandle)?)
         };
 
-        if handle_data.mode & FLAG_WRITE == 0 {
+        if handle_data.mode & OPEN_MODE_WRITE == 0 {
             return Err(VfsError::ActionNotAllowed);
         }
 
@@ -465,7 +485,7 @@ impl DevFsDriver for VgaDriver {
         Ok(bytes_written)
     }
 
-    fn fflush(&mut self, dev_fs: &mut DevFS, handle: u64) -> Result<(), VfsError> {
+    fn fflush(&mut self, dev_fs: &mut DevFs, handle: u64) -> Result<(), VfsError> {
         if !self.handles.contains(&handle) {
             return Err(VfsError::BadHandle);
         }
@@ -478,6 +498,13 @@ impl DevFsDriver for VgaDriver {
         let device = &mut **device;
 
         device.flush()
+    }
+
+    fn fsync(&mut self, _dev_fs: &mut DevFs, handle: u64) -> Result<(), VfsError> {
+        if !self.handles.contains(&handle) {
+            return Err(VfsError::BadHandle);
+        }
+        Ok(())
     }
 }
 
@@ -496,9 +523,9 @@ pub fn get_vga_driver() -> Arcrwb<dyn DevFsDriver> {
     }
 }
 
-pub fn init_vga(devfs: &mut DevFS) {
+pub fn init_vga(devfs: &mut DevFs) {
     let driver = get_vga_driver();
-    devfs.register_driver(driver);
+    devfs.register_driver(driver).unwrap();
 }
 
 pub fn use_vga_device<F: FnOnce(&VgaCharDevice)>(f: F) {

@@ -5,7 +5,7 @@
 use alloc::vec::Vec;
 use drivers::{
     pci,
-    vfs::{self, Vfs, FLAG_BINARY, FLAG_READ, FLAG_WRITE},
+    vfs::{self, Vfs, OPEN_MODE_BINARY, OPEN_MODE_READ, OPEN_MODE_WRITE},
 };
 use memory::mem::OsMemoryRegion;
 use obsiboot::ObsiBootKernelParameters;
@@ -79,11 +79,14 @@ pub fn _start(obsiboot_ptr: u64) -> ! {
                 .get_file(&"/dev/vga".chars().collect::<Vec<_>>())
                 .unwrap();
 
-            let fs = guard.get_os_by_id(vgafile.fs()).unwrap();
+            let fs = guard.get_fs_by_id(vgafile.fs()).unwrap();
             let guard: &mut dyn FileSystem = &mut **fs.write();
 
             let vga = guard
-                .fopen(&vgafile, FLAG_READ | FLAG_WRITE | FLAG_BINARY)
+                .fopen(
+                    &vgafile,
+                    OPEN_MODE_READ | OPEN_MODE_WRITE | OPEN_MODE_BINARY,
+                )
                 .unwrap();
 
             let params = vesa::get_mode_info();
