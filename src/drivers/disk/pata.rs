@@ -758,17 +758,7 @@ impl DevFsDriver for PataDevfsDriver {
                 .get_handle_data::<PataFsFileHandle>(handle)
                 .ok_or(VfsError::BadHandle)?)
         };
-        let len = {
-            let controller = handle_data.controller.read();
-            if controller.generation != handle_data.generation {
-                return Err(VfsError::BadHandle);
-            }
-            if !controller.is_present() {
-                return Err(VfsError::PathNotFound);
-            }
-            controller.size_bytes()
-            // Drop the controller as early as possible to let other threads access it
-        };
+        let len = 512 * (handle_data.disk_range.end - handle_data.disk_range.start);
 
         Ok(FileStat {
             size: len,

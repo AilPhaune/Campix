@@ -50,7 +50,7 @@ impl GUIDPartitionTableEntry {
     pub fn as_device_range(&self) -> BlockDeviceRange {
         BlockDeviceRange {
             start: self.first_lba,
-            end: self.last_lba,
+            end: self.last_lba + 1, // last_lba is inclusive
         }
     }
 }
