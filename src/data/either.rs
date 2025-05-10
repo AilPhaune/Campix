@@ -1,3 +1,7 @@
+use core::{any::type_name, fmt::Debug};
+
+use alloc::format;
+
 pub enum Either<A, B> {
     A(A),
     B(B),
@@ -194,6 +198,23 @@ impl<A: Copy, B: Copy> Either<&mut A, &mut B> {
         match self {
             Either::A(a) => Either::A(*a),
             Either::B(b) => Either::B(*b),
+        }
+    }
+}
+
+impl<A: Debug, B: Debug> Debug for Either<A, B> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let a = type_name::<A>();
+        let b = type_name::<B>();
+        match self {
+            Either::A(v) => f
+                .debug_struct(&format!("Either::<A={a}, B={b}>::A"))
+                .field("value", &v)
+                .finish(),
+            Either::B(v) => f
+                .debug_struct(&format!("Either::<A={a}, B={b}>::B"))
+                .field("value", &v)
+                .finish(),
         }
     }
 }

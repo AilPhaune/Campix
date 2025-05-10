@@ -7,9 +7,9 @@ use crate::{
         fs::virt::devfs::{fseek_helper, DevFs, DevFsDriver, DevFsHook, DevFsHookKind},
         pci::PciDevice,
         vfs::{
-            arcrwb_new_from_box, BlockDevice, FileStat, FileSystem, SubBlockDevice, VfsError,
-            VfsFile, VfsFileKind, FLAG_PARTITIONED_DEVICE, FLAG_PHYSICAL_BLOCK_DEVICE,
-            OPEN_MODE_APPEND, OPEN_MODE_BINARY, OPEN_MODE_READ,
+            arcrwb_new_from_box, BlockDevice, FileStat, FileSystem, FsSpecificFileData,
+            SubBlockDevice, VfsError, VfsFile, VfsFileKind, FLAG_PARTITIONED_DEVICE,
+            FLAG_PHYSICAL_BLOCK_DEVICE, OPEN_MODE_APPEND, OPEN_MODE_BINARY, OPEN_MODE_READ,
         },
     },
     io::{inb, inw, outb, outw},
@@ -54,6 +54,7 @@ pub enum PataDrive {
 
 #[derive(Debug)]
 pub struct PataController {
+    bus: PataBus,
     drive: PataDrive,
     base_io: u16,    // Base I/O port (like 0x1F0 or 0x170)
     control_io: u16, // Control port (like 0x3F6 or 0x376)
@@ -71,6 +72,7 @@ impl PataController {
             PataBus::Secondary => (0x170, 0x376),
         };
         Self {
+            bus,
             drive,
             base_io,
             control_io,
@@ -365,6 +367,15 @@ impl BlockDevice for PataBlockDevice {
     }
 }
 
+#[derive(Debug)]
+pub struct PataSpecificFileData {
+    pub bus: PataBus,
+    pub drive: PataDrive,
+    pub partition: Option<Partition>,
+}
+
+impl FsSpecificFileData for PataSpecificFileData {}
+
 const PATA: u64 = u64::from_be_bytes([0, 0, 0, 0, b'p', b'a', b't', b'a']);
 
 #[derive(Debug, Clone)]
@@ -428,6 +439,7 @@ impl DevFsDriver for PataDevfsDriver {
                 false
             };
             let generation = guard.generation;
+            let (bus, drive) = (guard.bus, guard.drive);
             drop(guard);
             let device: Arc<RwLock<Box<dyn BlockDevice>>> =
                 arcrwb_new_from_box(Box::new(PataBlockDevice {
@@ -453,6 +465,11 @@ impl DevFsDriver for PataDevfsDriver {
                         0,
                         dev_fs.os_id(),
                         dev_fs.os_id(),
+                        Arc::new(PataSpecificFileData {
+                            bus,
+                            drive,
+                            partition: Some(partition.clone()),
+                        }),
                     );
                     dev_fs.replace_hook(
                         name.chars().collect(),
@@ -474,6 +491,11 @@ impl DevFsDriver for PataDevfsDriver {
                 0,
                 dev_fs.os_id(),
                 dev_fs.os_id(),
+                Arc::new(PataSpecificFileData {
+                    bus,
+                    drive,
+                    partition: None,
+                }),
             );
             dev_fs.replace_hook(
                 name,
@@ -764,7 +786,7 @@ impl DevFsDriver for PataDevfsDriver {
             size: len,
             is_directory: false,
             is_symlink: false,
-            permissions: permissions!(Owner:Read, Owner:Write).to_u32(),
+            permissions: permissions!(Owner:Read, Owner:Write).to_u64(),
             owner_id: 0,
             group_id: 0,
             created_at: 0,

@@ -1,11 +1,17 @@
 #![no_std]
 #![no_main]
 
-use alloc::string::String;
-use data::file::File;
+use core::num::NonZeroUsize;
+
+use alloc::{boxed::Box, string::String, vec::Vec};
+use data::{
+    alloc_boxed_slice,
+    file::{DirectoryEntry, File},
+};
 use drivers::{
+    fs::phys::ext2::Ext2Volume,
     pci,
-    vfs::{OPEN_MODE_BINARY, OPEN_MODE_READ},
+    vfs::{get_vfs, OPEN_MODE_BINARY, OPEN_MODE_READ},
 };
 use memory::mem::OsMemoryRegion;
 use obsiboot::ObsiBootKernelParameters;
@@ -71,24 +77,43 @@ pub fn _start(obsiboot_ptr: u64) -> ! {
         }
 
         {
-            println!("\nListing /dev directory:");
-            for entry in File::list_directory("/dev").unwrap().iter() {
-                println!("{}", entry.full_name().iter().collect::<String>());
-            }
-            println!();
-
             let file = File::open("/dev/pata_pm_p0", OPEN_MODE_READ | OPEN_MODE_BINARY).unwrap();
+            let ext2 = Ext2Volume::from_device(file, NonZeroUsize::new(10 * 1024 * 1024).unwrap())
+                .unwrap();
+            println!("{:#?}", ext2);
 
-            let mut buf = [0u8; 2048];
-            let bytes_read = file.read(&mut buf).unwrap();
-            println!("Read {} bytes from /dev/pata_pm_p0 :", bytes_read);
+            let vfs = get_vfs();
+            let mut wguard = vfs.write();
+            wguard
+                .mount(&"system".chars().collect::<Vec<char>>(), Box::new(ext2))
+                .unwrap();
+            drop(wguard);
 
-            // hexdump
-            hexdump(&buf[0..bytes_read as usize]);
+            println!("\nListing files:");
+            let directory = DirectoryEntry::of("/").unwrap();
+            dumpfs_tree(&directory, 0);
             println!();
         }
 
+        {
+            let file = File::open("/system/obsiboot.conf", OPEN_MODE_READ).unwrap();
+            let mut buffer = alloc_boxed_slice(file.stats().unwrap().size as usize);
+            let read = file.read(&mut buffer).unwrap() as usize;
+            hexdump(&buffer[0..read]);
+        }
+
         kmain(obsiboot);
+    }
+}
+
+pub fn dumpfs_tree(dir: &DirectoryEntry, indent: usize) {
+    let name = dir.name();
+    let name = name.iter().collect::<String>();
+    println!("{}/{}", " ".repeat(indent), name);
+    if let Ok(dir) = dir.get_dir() {
+        for entry in dir.list().unwrap().iter() {
+            dumpfs_tree(entry, indent + 2);
+        }
     }
 }
 

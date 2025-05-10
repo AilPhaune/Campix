@@ -1,8 +1,9 @@
-use core::{any::Any, fmt::Debug};
+use core::{alloc::Layout, any::Any, fmt::Debug};
 
 use alloc::{
+    alloc::{alloc, dealloc},
     boxed::Box,
-    collections::BTreeMap,
+    collections::{btree_map::Entry, BTreeMap, BTreeSet},
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
@@ -40,12 +41,14 @@ pub enum VfsError {
     FileSystemNotMounted,
     BadBufferSize,
     NotDirectory,
+    NotFile,
     NotMountPoint,
     OutOfBounds,
     UnknownError,
     InvalidOpenMode,
     InvalidSeekPosition,
     BadHandle,
+    AlreadyMounted,
     DriverError(Box<dyn core::fmt::Debug>),
 }
 
@@ -70,6 +73,8 @@ impl Debug for VfsFileKind {
     }
 }
 
+pub trait FsSpecificFileData: AsAny + Debug + Send + Sync {}
+
 #[derive(Clone, Debug)]
 pub struct VfsFile {
     kind: VfsFileKind,
@@ -77,6 +82,7 @@ pub struct VfsFile {
     size: u64,
     parent_fs: u64,
     fs: u64,
+    fs_specific: Arc<dyn FsSpecificFileData>,
 }
 
 impl VfsFile {
@@ -99,6 +105,10 @@ impl VfsFile {
             VfsFileKind::CharacterDevice { device } => Some(device.clone()),
             _ => None,
         }
+    }
+
+    pub fn get_fs_specific_data(&self) -> Arc<dyn FsSpecificFileData> {
+        self.fs_specific.clone()
     }
 
     pub fn is_directory(&self) -> bool {
@@ -129,6 +139,7 @@ impl VfsFile {
         size: u64,
         parent_fs: u64,
         fs: u64,
+        fs_specific: Arc<dyn FsSpecificFileData>,
     ) -> Self {
         Self {
             kind,
@@ -136,6 +147,7 @@ impl VfsFile {
             size,
             parent_fs,
             fs,
+            fs_specific,
         }
     }
 
@@ -143,7 +155,7 @@ impl VfsFile {
         &self.kind
     }
 
-    pub fn name(&self) -> &Vec<char> {
+    pub fn name(&self) -> &[char] {
         &self.name
     }
 
@@ -180,6 +192,7 @@ pub trait CharacterDevice: Send + Sync + core::fmt::Debug + AsAny {
 pub trait AsAny {
     fn as_any_mut(&mut self) -> &mut dyn Any;
     fn as_any(&self) -> &dyn Any;
+    fn type_name(&self) -> &'static str;
 }
 
 #[derive(Debug, Clone)]
@@ -324,8 +337,9 @@ impl CharacterDevice for BlockDeviceAsCharacterDevice {
 
 pub const OPEN_MODE_READ: u64 = 1 << 0;
 pub const OPEN_MODE_WRITE: u64 = 1 << 1;
-pub const OPEN_MODE_APPEND: u64 = 1 << 2;
-pub const OPEN_MODE_BINARY: u64 = 1 << 3;
+pub const OPEN_MODE_BINARY: u64 = 1 << 2;
+pub const OPEN_MODE_APPEND: u64 = 1 << 3;
+pub const OPEN_MODE_TRUNCATE: u64 = 1 << 4;
 
 #[derive(Debug, Clone, Copy)]
 pub enum SeekPosition {
@@ -349,11 +363,11 @@ pub struct FileStat {
     pub size: u64,
     pub created_at: u64,
     pub modified_at: u64,
-    pub permissions: u32,
+    pub permissions: u64,
     pub is_directory: bool,
     pub is_symlink: bool,
-    pub owner_id: u32,
-    pub group_id: u32,
+    pub owner_id: u64,
+    pub group_id: u64,
     pub flags: u64,
 }
 
@@ -368,7 +382,7 @@ pub trait FileSystem: Send + Sync + core::fmt::Debug + AsAny {
     fn host_block_device(&self) -> Option<Arcrwb<dyn BlockDevice>>;
 
     /// Returns the root of the file system
-    fn get_root(&self) -> VfsFile;
+    fn get_root(&self) -> Result<VfsFile, VfsError>;
 
     /// Returns the mount point of the file system, none for the absolute root
     fn get_mount_point(&self) -> Result<Option<VfsFile>, VfsError>;
@@ -390,21 +404,8 @@ pub trait FileSystem: Send + Sync + core::fmt::Debug + AsAny {
         kind: VfsFileKind,
     ) -> Result<VfsFile, VfsError>;
 
-    /// Mounts a file system in the given directory
-    fn mount(
-        &mut self,
-        directory: &VfsFile,
-        name: &[char],
-        fs: Box<dyn FileSystem>,
-    ) -> Result<VfsFile, VfsError>;
-
-    /// Unmounts a file system at the given mount point
-    fn unmount(&mut self, mount_point: &VfsFile) -> Result<(), VfsError>;
-
-    /// Returns all sub file systems
-    fn sub_file_systems(&self) -> Result<Vec<Arcrwb<dyn FileSystem>>, VfsError>;
-
     /// Called when filesystem is mounted
+    /// Returns the root directory of the mounted filesystem
     fn on_mount(
         &mut self,
         mount_point: &VfsFile,
@@ -421,9 +422,6 @@ pub trait FileSystem: Send + Sync + core::fmt::Debug + AsAny {
 
     /// Gets the root file system
     fn get_vfs(&self) -> Result<WeakArcrwb<Vfs>, VfsError>;
-
-    /// Syncs the file system
-    fn sync(&mut self) -> Result<(), VfsError>;
 
     /// Opens a file
     /// Returns the file handle
@@ -460,10 +458,27 @@ pub struct PathSplitter<'a> {
     last_part: Option<&'a [char]>,
 }
 
+pub struct PathSplitterPeek<'a, 'b>
+where
+    'a: 'b,
+{
+    splitter: &'b mut PathSplitter<'a>,
+    slice: &'a [char],
+    idx: usize,
+}
+
+impl<'a> PathSplitterPeek<'a, '_> {
+    pub fn apply(self) -> &'a [char] {
+        self.splitter.last_part = Some(self.slice);
+        self.splitter.idx = self.idx;
+        self.slice
+    }
+}
+
 impl<'a> PathSplitter<'a> {
     pub fn new(path: &'a [char]) -> Self {
         let mut idx = 0;
-        while path[idx] == '/' {
+        while idx < path.len() && path[idx] == '/' {
             idx += 1;
         }
         Self {
@@ -477,15 +492,35 @@ impl<'a> PathSplitter<'a> {
         self.idx >= self.path.len()
     }
 
-    pub fn next_part(&mut self) -> &[char] {
-        let mut idx = self.idx;
-        while idx < self.path.len() && self.path[idx] != '/' {
-            idx += 1;
+    pub fn peek<'b>(&'b mut self) -> Option<PathSplitterPeek<'a, 'b>>
+    where
+        'a: 'b,
+    {
+        if self.is_done() {
+            None
+        } else {
+            let mut idx = self.idx;
+            while idx < self.path.len() && self.path[idx] != '/' {
+                idx += 1;
+            }
+            let slice = &self.path[self.idx..idx];
+            while idx < self.path.len() && self.path[idx] == '/' {
+                idx += 1;
+            }
+
+            Some(PathSplitterPeek {
+                splitter: self,
+                slice,
+                idx,
+            })
         }
-        let slice = &self.path[self.idx..idx];
-        self.last_part = Some(slice);
-        self.idx = idx + 1;
-        slice
+    }
+
+    pub fn next_part(&mut self) -> &'a [char] {
+        match self.peek() {
+            None => &self.path[self.idx..],
+            Some(peek) => peek.apply(),
+        }
     }
 
     pub fn last_part(&self) -> Option<&[char]> {
@@ -506,7 +541,7 @@ impl<'a, 'b> PathTraverse<'a, 'b> {
     ) -> Result<PathTraverse<'a, 'b>, VfsError> {
         Ok(PathTraverse {
             spliter: PathSplitter::new(path),
-            curr: fs.read().get_root(),
+            curr: fs.read().get_root()?,
             fs: Either::new_left(fs.clone()),
         })
     }
@@ -517,7 +552,7 @@ impl<'a, 'b> PathTraverse<'a, 'b> {
     ) -> Result<PathTraverse<'a, 'b>, VfsError> {
         Ok(PathTraverse {
             spliter: PathSplitter::new(path),
-            curr: fs.get_root(),
+            curr: fs.get_root()?,
             fs: Either::new_right(fs),
         })
     }
@@ -533,7 +568,7 @@ impl<'a, 'b> PathTraverse<'a, 'b> {
         if let Some(fs) = self.curr.get_mounted_fs() {
             {
                 let guard = fs.read();
-                self.curr = guard.get_root();
+                self.curr = guard.get_root()?;
             }
             self.fs = Either::new_left(fs.clone());
         }
@@ -554,9 +589,124 @@ impl<'a, 'b> PathTraverse<'a, 'b> {
 }
 
 #[derive(Debug)]
+pub struct MountNode {
+    children: BTreeMap<Vec<char>, MountNode>,
+    contents: Option<WeakArcrwb<dyn FileSystem>>,
+}
+
+#[derive(Debug)]
+pub struct MountingPointsManager {
+    tree: MountNode,
+}
+
+impl Default for MountingPointsManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MountingPointsManager {
+    pub fn new() -> Self {
+        Self {
+            tree: MountNode {
+                children: BTreeMap::new(),
+                contents: None,
+            },
+        }
+    }
+
+    pub fn register_fs(
+        &mut self,
+        name: &[char],
+        fs: Arcrwb<dyn FileSystem>,
+    ) -> Result<(), VfsError> {
+        let mut splitter = PathSplitter::new(name);
+
+        let mut node = &mut self.tree;
+        while !splitter.is_done() {
+            if node.contents.is_some() {
+                return Err(VfsError::AlreadyMounted);
+            }
+            let part = splitter.next_part();
+            match node.children.entry(part.to_vec()) {
+                Entry::Vacant(entry) => {
+                    node = entry.insert(MountNode {
+                        children: BTreeMap::new(),
+                        contents: None,
+                    });
+                }
+                Entry::Occupied(entry) => {
+                    node = entry.into_mut();
+                }
+            }
+        }
+
+        if !node.children.is_empty() || node.contents.is_some() {
+            return Err(VfsError::AlreadyMounted);
+        }
+
+        node.contents = Some(Arc::downgrade(&fs));
+        Ok(())
+    }
+
+    pub fn search_fs<'a>(
+        &self,
+        name: &'a [char],
+    ) -> Option<(WeakArcrwb<dyn FileSystem>, PathSplitter<'a>)> {
+        let mut splitter = PathSplitter::new(name);
+
+        let mut node = &self.tree;
+        while !splitter.is_done() {
+            let part = splitter.next_part();
+            match node.children.get(part) {
+                Some(child) => {
+                    node = child;
+                }
+                None => {
+                    return node.contents.as_ref().map(|fs| (fs.clone(), splitter));
+                }
+            }
+        }
+
+        node.contents.as_ref().map(|fs| (fs.clone(), splitter))
+    }
+
+    pub fn remove_fs(&mut self, name: &[char]) -> Result<WeakArcrwb<dyn FileSystem>, VfsError> {
+        Self::remove_fs_recursive(&mut self.tree, PathSplitter::new(name))
+    }
+
+    fn remove_fs_recursive(
+        node: &mut MountNode,
+        mut splitter: PathSplitter,
+    ) -> Result<WeakArcrwb<dyn FileSystem>, VfsError> {
+        if splitter.is_done() {
+            match node.contents.take() {
+                Some(fs) => Ok(fs),
+                None => Err(VfsError::PathNotFound),
+            }
+        } else {
+            let part = splitter.next_part();
+            match node.children.get_mut(part) {
+                Some(child) => {
+                    let fs = Self::remove_fs_recursive(child, splitter)?;
+
+                    if child.children.is_empty() && child.contents.is_none() {
+                        node.children.remove(part);
+                    }
+
+                    Ok(fs)
+                }
+                None => Err(VfsError::PathNotFound),
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct Vfs {
     fs_by_id: Arcrwb<BTreeMap<u64, Arcrwb<dyn FileSystem>>>,
-    fs_by_name: Arcrwb<BTreeMap<Vec<char>, Arcrwb<dyn FileSystem>>>,
+
+    mounting_points_manager: MountingPointsManager,
 
     root_fs: Option<WeakArcrwb<Vfs>>,
     os_id_count: u64,
@@ -572,18 +722,72 @@ impl Vfs {
         self.fs_by_id.read().get(&id).cloned()
     }
 
-    pub fn get_fs_by_name(&self, name: &[char]) -> Option<Arcrwb<dyn FileSystem>> {
-        self.fs_by_name.read().get(name).cloned()
-    }
-
-    pub fn register_fs(&self, os_id: u64, name: &[char], ptr: &Arcrwb<dyn FileSystem>) {
+    fn register_fs(
+        &mut self,
+        os_id: u64,
+        name: &[char],
+        ptr: &Arcrwb<dyn FileSystem>,
+    ) -> Result<(), VfsError> {
         let mut wguard = self.fs_by_id.write();
         wguard.insert(os_id, ptr.clone());
 
-        let mut wguard = self.fs_by_name.write();
-        wguard.insert(name.to_vec(), ptr.clone());
+        self.mounting_points_manager.register_fs(name, ptr.clone())
+    }
+
+    pub fn mount(&mut self, name: &[char], fs: Box<dyn FileSystem>) -> Result<VfsFile, VfsError> {
+        let root_fs = self.root_fs.clone().ok_or(VfsError::FileSystemNotMounted)?;
+        let name = name.to_vec();
+
+        let os_id = self.next_os_id();
+        let ptr = arcrwb_new_from_box(fs);
+
+        self.register_fs(os_id, &name, &ptr)?;
+
+        let mount_point = VfsFile {
+            kind: VfsFileKind::MountPoint {
+                mounted_fs: ptr.clone(),
+            },
+            name,
+            size: 0,
+            parent_fs: self.os_id(),
+            fs: os_id,
+            fs_specific: Arc::new(VfsSpecificFileData),
+        };
+
+        (&mut **ptr.write() as &mut dyn FileSystem).on_mount(&mount_point, os_id, root_fs)?;
+
+        Ok(mount_point)
+    }
+
+    pub fn unmount(&mut self, name: &[char]) -> Result<(), VfsError> {
+        let fs = self.mounting_points_manager.remove_fs(name)?;
+        let Some(fs) = fs.upgrade() else {
+            return Err(VfsError::UnknownError);
+        };
+        let mut guard = fs.write();
+
+        let id = guard.os_id();
+
+        {
+            let mut wguard = self.fs_by_id.write();
+            wguard.remove(&id);
+        }
+
+        #[allow(clippy::never_loop)]
+        while !guard.on_pre_unmount()? {
+            // TODO: Let driver do their thing
+            break;
+        }
+        guard.on_unmount()?;
+
+        Ok(())
     }
 }
+
+#[derive(Debug, Default)]
+pub struct VfsSpecificFileData;
+
+impl FsSpecificFileData for VfsSpecificFileData {}
 
 impl<T: Any> AsAny for T {
     fn as_any(&self) -> &dyn Any {
@@ -593,7 +797,29 @@ impl<T: Any> AsAny for T {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+
+    fn type_name(&self) -> &'static str {
+        core::any::type_name::<T>()
+    }
 }
+
+macro_rules! default_get_file_implementation {
+    () => {
+        fn get_file(&self, path: &[char]) -> Result<VfsFile, VfsError> {
+            let mut traverse = $crate::drivers::vfs::PathTraverse::new_owned(path, self)?;
+            if traverse.is_done() {
+                return self.get_root();
+            }
+            loop {
+                let result = traverse.find_next()?;
+                if traverse.is_done() {
+                    break Ok(result);
+                }
+            }
+        }
+    };
+}
+pub(crate) use default_get_file_implementation;
 
 impl FileSystem for Vfs {
     fn os_id(&self) -> u64 {
@@ -608,14 +834,15 @@ impl FileSystem for Vfs {
         None
     }
 
-    fn get_root(&self) -> VfsFile {
-        VfsFile {
+    fn get_root(&self) -> Result<VfsFile, VfsError> {
+        Ok(VfsFile {
             kind: VfsFileKind::Directory,
             name: "/".chars().collect(),
             size: 0,
             parent_fs: self.os_id(),
             fs: self.os_id(),
-        }
+            fs_specific: Arc::new(VfsSpecificFileData),
+        })
     }
 
     fn get_mount_point(&self) -> Result<Option<VfsFile>, VfsError> {
@@ -629,9 +856,6 @@ impl FileSystem for Vfs {
         if file.fs != self.os_id() {
             return Err(VfsError::FileSystemMismatch);
         }
-        if file.name != ['/'] && !file.is_mount_point() {
-            return Err(VfsError::PathNotFound);
-        }
         if file.is_mount_point() {
             return file
                 .get_mounted_fs()
@@ -639,71 +863,107 @@ impl FileSystem for Vfs {
                 .read()
                 .get_child(file, child);
         }
-        let fs = self
-            .fs_by_name
-            .read()
-            .get(child)
-            .cloned()
-            .ok_or(VfsError::PathNotFound)?;
 
-        let fs_id = fs.read().os_id();
+        let mut node = &self.mounting_points_manager.tree;
+        let mut splitter = PathSplitter::new(file.name());
+        while !splitter.is_done() {
+            let part = splitter.next_part();
+            match node.children.get(part) {
+                None => return Err(VfsError::PathNotFound),
+                Some(child) => node = child,
+            }
+        }
 
-        Ok(VfsFile {
-            kind: VfsFileKind::MountPoint {
-                mounted_fs: fs.clone(),
+        match node.children.get(child) {
+            None => Err(VfsError::PathNotFound),
+            Some(c) => match &c.contents {
+                None => Ok(VfsFile {
+                    kind: VfsFileKind::Directory,
+                    name: [file.name(), &['/'], child].concat(),
+                    size: 0,
+                    parent_fs: self.os_id(),
+                    fs: self.os_id(),
+                    fs_specific: Arc::new(VfsSpecificFileData),
+                }),
+                Some(fs) => {
+                    let fs = fs.upgrade().ok_or(VfsError::UnknownError)?;
+                    let guard = fs.read();
+                    Ok(VfsFile {
+                        kind: VfsFileKind::MountPoint {
+                            mounted_fs: fs.clone(),
+                        },
+                        name: [file.name(), &['/'], child].concat(),
+                        size: 0,
+                        parent_fs: self.os_id(),
+                        fs: guard.os_id(),
+                        fs_specific: Arc::new(VfsSpecificFileData),
+                    })
+                }
             },
-            name: child.to_vec(),
-            size: 0,
-            parent_fs: self.os_id(),
-            fs: fs_id,
-        })
+        }
     }
 
     fn list_children(&self, file: &VfsFile) -> Result<Vec<VfsFile>, VfsError> {
-        if file.fs != self.os_id() {
-            return Err(VfsError::FileSystemMismatch);
-        }
-        if file.name != ['/'] && !file.is_mount_point() {
-            return Err(VfsError::PathNotFound);
-        }
         if file.is_mount_point() {
             let fs = file
                 .get_mounted_fs()
                 .ok_or(VfsError::FileSystemNotMounted)?;
             let guard = fs.read();
 
-            let root = guard.get_root();
+            let root = guard.get_root()?;
             return guard.list_children(&root);
         }
+        if !file.is_directory() {
+            return Err(VfsError::NotDirectory);
+        }
+        if file.fs != self.os_id() {
+            let fs = self
+                .get_fs_by_id(file.fs)
+                .ok_or(VfsError::FileSystemNotMounted)?;
+            return fs.read().list_children(file);
+        }
 
-        Ok(self
-            .fs_by_name
-            .read()
+        let mut node = &self.mounting_points_manager.tree;
+        let mut splitter = PathSplitter::new(file.name());
+        while !splitter.is_done() {
+            let part = splitter.next_part();
+            match node.children.get(part) {
+                None => return Err(VfsError::PathNotFound),
+                Some(child) => node = child,
+            }
+        }
+
+        Ok(node
+            .children
             .iter()
-            .map(|(k, fs)| {
-                let _ = 0;
-                VfsFile {
-                    kind: VfsFileKind::MountPoint {
-                        mounted_fs: fs.clone(),
-                    },
-                    name: k.to_vec(),
+            .filter_map(|(k, node)| match &node.contents {
+                None => Some(VfsFile {
+                    kind: VfsFileKind::Directory,
+                    name: [file.name(), &['/'], k].concat(),
                     size: 0,
                     parent_fs: self.os_id(),
-                    fs: fs.read().os_id(),
+                    fs: self.os_id(),
+                    fs_specific: Arc::new(VfsSpecificFileData),
+                }),
+                Some(fs) => {
+                    let fs = fs.upgrade()?;
+                    let os_id = fs.read().os_id();
+                    Some(VfsFile {
+                        kind: VfsFileKind::MountPoint {
+                            mounted_fs: fs.clone(),
+                        },
+                        name: k.to_vec(),
+                        size: 0,
+                        parent_fs: self.os_id(),
+                        fs: os_id,
+                        fs_specific: Arc::new(VfsSpecificFileData),
+                    })
                 }
             })
             .collect::<Vec<_>>())
     }
 
-    fn get_file(&self, path: &[char]) -> Result<VfsFile, VfsError> {
-        let mut traverse = PathTraverse::new_owned(path, self)?;
-        loop {
-            let result = traverse.find_next()?;
-            if traverse.is_done() {
-                break Ok(result);
-            }
-        }
-    }
+    default_get_file_implementation!();
 
     fn create_child(
         &mut self,
@@ -718,69 +978,6 @@ impl FileSystem for Vfs {
             return Err(VfsError::NotDirectory);
         }
         Err(VfsError::ActionNotAllowed)
-    }
-
-    fn mount(
-        &mut self,
-        directory: &VfsFile,
-        name: &[char],
-        fs: Box<dyn FileSystem>,
-    ) -> Result<VfsFile, VfsError> {
-        if directory.fs != self.os_id() {
-            return Err(VfsError::FileSystemMismatch);
-        }
-        if !directory.is_directory() {
-            return Err(VfsError::NotDirectory);
-        }
-        if directory.name != ['/'] {
-            return Err(VfsError::ActionNotAllowed);
-        }
-        let root_fs = self.root_fs.clone().ok_or(VfsError::FileSystemNotMounted)?;
-
-        let name = name.to_vec();
-
-        let os_id = self.next_os_id();
-        let ptr = arcrwb_new_from_box(fs);
-
-        self.register_fs(os_id, &name, &ptr);
-
-        let mount_point = VfsFile {
-            kind: VfsFileKind::MountPoint {
-                mounted_fs: ptr.clone(),
-            },
-            name,
-            size: 0,
-            parent_fs: self.os_id(),
-            fs: os_id,
-        };
-
-        (&mut **ptr.write() as &mut dyn FileSystem).on_mount(&mount_point, os_id, root_fs)?;
-
-        Ok(mount_point)
-    }
-
-    fn unmount(&mut self, mount_point: &VfsFile) -> Result<(), VfsError> {
-        if mount_point.fs != self.os_id() {
-            return Err(VfsError::FileSystemMismatch);
-        }
-        if !mount_point.is_mount_point() {
-            return Err(VfsError::NotMountPoint);
-        }
-
-        {
-            let mut wguard = self.fs_by_id.write();
-            wguard.remove(&mount_point.fs);
-
-            let mut wguard = self.fs_by_name.write();
-            wguard.remove(&mount_point.name);
-        }
-
-        Ok(())
-    }
-
-    fn sub_file_systems(&self) -> Result<Vec<Arcrwb<dyn FileSystem>>, VfsError> {
-        let v = self.fs_by_id.read().values().cloned().collect::<Vec<_>>();
-        Ok(v)
     }
 
     fn on_mount(
@@ -806,10 +1003,6 @@ impl FileSystem for Vfs {
             .as_ref()
             .ok_or(VfsError::FileSystemNotMounted)?
             .clone())
-    }
-
-    fn sync(&mut self) -> Result<(), VfsError> {
-        Ok(())
     }
 
     fn fopen(&mut self, file: &VfsFile, _mode: u64) -> Result<u64, VfsError> {
@@ -849,6 +1042,53 @@ impl FileSystem for Vfs {
     }
 }
 
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct VfsHandleData<T: Sized + Clone + Debug> {
+    layout: Layout,
+    data: T,
+}
+
+#[derive(Debug, Default)]
+pub struct FileHandleAllocator {
+    handles: BTreeSet<u64>,
+}
+
+impl FileHandleAllocator {
+    pub fn alloc_file_handle<T: Sized + Clone + Debug>(&mut self, data: T) -> u64 {
+        let handle = unsafe {
+            let layout = Layout::from_size_align_unchecked(
+                size_of::<VfsHandleData<T>>(),
+                align_of::<VfsHandleData<T>>(),
+            );
+            let handle = alloc(layout) as *mut VfsHandleData<T>;
+            handle.write(VfsHandleData { data, layout });
+            handle as u64
+        };
+        self.handles.insert(handle);
+        handle
+    }
+
+    /// # Safety
+    /// Caller must ensure that the handle is valid and was allocated using `alloc_file_handle` with the same `T` type
+    pub unsafe fn get_handle_data<T: Sized + Clone + Debug>(&self, handle: u64) -> Option<*mut T> {
+        let handle_data = handle as *mut VfsHandleData<T>;
+        Some(&mut (*handle_data).data as *mut T)
+    }
+
+    pub fn dealloc_file_handle<T: Sized + Clone + Debug>(&mut self, handle: u64) {
+        if self.handles.contains(&handle) {
+            unsafe {
+                dealloc(
+                    handle as *mut u8,
+                    (*(handle as *mut VfsHandleData<T>)).layout,
+                )
+            };
+            self.handles.remove(&handle);
+        }
+    }
+}
+
 static mut VFS: Option<Arcrwb<Vfs>> = None;
 
 pub fn get_vfs() -> Arcrwb<Vfs> {
@@ -858,7 +1098,7 @@ pub fn get_vfs() -> Arcrwb<Vfs> {
             None => {
                 let v = Vfs {
                     fs_by_id: arcrwb_new(BTreeMap::new()),
-                    fs_by_name: arcrwb_new(BTreeMap::new()),
+                    mounting_points_manager: MountingPointsManager::new(),
                     root_fs: None,
                     os_id_count: 1,
                 };

@@ -1,14 +1,14 @@
-pub const OWNER_READ: u32 = 1 << 0;
-pub const OWNER_WRITE: u32 = 1 << 1;
-pub const OWNER_EXECUTE: u32 = 1 << 2;
-pub const GROUP_READ: u32 = 1 << 3;
-pub const GROUP_WRITE: u32 = 1 << 4;
-pub const GROUP_EXECUTE: u32 = 1 << 5;
-pub const OTHER_READ: u32 = 1 << 6;
-pub const OTHER_WRITE: u32 = 1 << 7;
-pub const OTHER_EXECUTE: u32 = 1 << 8;
+pub const OWNER_READ: u64 = 1 << 0;
+pub const OWNER_WRITE: u64 = 1 << 1;
+pub const OWNER_EXECUTE: u64 = 1 << 2;
+pub const GROUP_READ: u64 = 1 << 3;
+pub const GROUP_WRITE: u64 = 1 << 4;
+pub const GROUP_EXECUTE: u64 = 1 << 5;
+pub const OTHER_READ: u64 = 1 << 6;
+pub const OTHER_WRITE: u64 = 1 << 7;
+pub const OTHER_EXECUTE: u64 = 1 << 8;
 
-pub const EXTENDED_PERMISSIONS: u32 = 1 << 31;
+pub const EXTENDED_PERMISSIONS: u64 = 1 << 63;
 
 pub enum PermissionLevel {
     Owner,
@@ -17,7 +17,7 @@ pub enum PermissionLevel {
 }
 
 impl PermissionLevel {
-    pub const fn get_standard_shift(&self) -> u32 {
+    pub const fn get_standard_shift(&self) -> u64 {
         match self {
             PermissionLevel::Owner => 0,
             PermissionLevel::Group => 3,
@@ -33,7 +33,7 @@ pub enum PermissionType {
 }
 
 impl PermissionType {
-    pub const fn get_standard_value(&self) -> u32 {
+    pub const fn get_standard_value(&self) -> u64 {
         match self {
             PermissionType::Read => OWNER_READ,
             PermissionType::Write => OWNER_WRITE,
@@ -42,14 +42,14 @@ impl PermissionType {
     }
 }
 
-pub struct Permissions(pub u32);
+pub struct Permissions(pub u64);
 
 impl Permissions {
-    pub const fn to_u32(&self) -> u32 {
+    pub const fn to_u64(&self) -> u64 {
         self.0
     }
 
-    pub const fn from_u32(value: u32) -> Self {
+    pub const fn from_u64(value: u64) -> Self {
         Self(value)
     }
 

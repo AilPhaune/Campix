@@ -1,12 +1,27 @@
-use alloc::vec::Vec;
+use core::fmt::Debug;
 
-use crate::drivers::vfs::{get_vfs, Arcrwb, FileStat, FileSystem, SeekPosition, VfsError, VfsFile};
+use alloc::{string::String, vec::Vec};
+
+use crate::drivers::vfs::{
+    get_vfs, Arcrwb, FileStat, FileSystem, SeekPosition, VfsError, VfsFile, VfsFileKind,
+};
 
 pub struct File {
+    mode: u64,
     path: Vec<char>,
     fs: Arcrwb<dyn FileSystem>,
     file: VfsFile,
     handle: u64,
+}
+
+impl Debug for File {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("File")
+            .field("mode", &self.mode)
+            .field("path", &self.path.iter().collect::<String>())
+            .field("handle", &self.handle)
+            .finish()
+    }
 }
 
 impl File {
@@ -24,6 +39,7 @@ impl File {
         drop(guard);
 
         Ok(File {
+            mode,
             path,
             fs,
             file,
@@ -47,7 +63,12 @@ impl File {
             fs: sub_fs,
             file: entry.entry.clone(),
             handle,
+            mode,
         })
+    }
+
+    pub fn get_open_mode(&self) -> u64 {
+        self.mode
     }
 
     pub fn stats(&self) -> Result<FileStat, VfsError> {
@@ -113,7 +134,7 @@ impl File {
                 .get_mounted_fs()
                 .ok_or(VfsError::FileSystemNotMounted)?;
             let guard = &**fs.read();
-            let directory = guard.get_root();
+            let directory = guard.get_root()?;
             return Ok(guard
                 .list_children(&directory)?
                 .iter()
@@ -143,6 +164,30 @@ impl Drop for File {
     }
 }
 
+pub struct Directory {
+    path: String,
+}
+
+impl Directory {
+    pub fn of(path: &[char]) -> Self {
+        let mut value = path.to_vec();
+        while let Some(c) = value.last() {
+            if *c == '/' {
+                value.pop();
+            } else {
+                break;
+            }
+        }
+        Self {
+            path: value.iter().collect::<String>(),
+        }
+    }
+
+    pub fn list(&self) -> Result<Vec<DirectoryEntry>, VfsError> {
+        File::list_directory(&self.path)
+    }
+}
+
 pub struct DirectoryEntry {
     full_name: Vec<char>,
     entry: VfsFile,
@@ -150,7 +195,17 @@ pub struct DirectoryEntry {
 
 impl DirectoryEntry {
     pub fn name(&self) -> &[char] {
-        self.entry.name()
+        let name = self.entry.name();
+        let mut last_idx = name.len() - 1;
+        while let Some(c) = name.get(last_idx) {
+            if *c == '/' {
+                last_idx -= 1;
+            } else {
+                break;
+            }
+        }
+        last_idx += 1;
+        &name[0..last_idx]
     }
 
     pub fn full_name(&self) -> &[char] {
@@ -159,5 +214,44 @@ impl DirectoryEntry {
 
     pub fn open(&self, mode: u64) -> Result<File, VfsError> {
         File::open_entry(self, mode)
+    }
+
+    pub fn get_dir(&self) -> Result<Directory, VfsError> {
+        match self.entry.kind() {
+            VfsFileKind::Directory | VfsFileKind::MountPoint { .. } => {
+                Ok(Directory::of(self.full_name()))
+            }
+            _ => Err(VfsError::NotDirectory),
+        }
+    }
+
+    pub fn of(path: &str) -> Result<DirectoryEntry, VfsError> {
+        let mut path = path.chars().collect::<Vec<char>>();
+        while let Some(c) = path.last() {
+            if *c == '/' {
+                path.pop();
+            } else {
+                break;
+            }
+        }
+        let fs = get_vfs();
+        let guard: &dyn FileSystem = &**fs.read();
+        let directory = guard.get_file(&path)?;
+        if directory.is_mount_point() {
+            let fs = directory
+                .get_mounted_fs()
+                .ok_or(VfsError::FileSystemNotMounted)?;
+            let guard = &**fs.read();
+            let directory = guard.get_root()?;
+            Ok(DirectoryEntry {
+                full_name: path,
+                entry: directory,
+            })
+        } else {
+            Ok(DirectoryEntry {
+                full_name: path,
+                entry: directory,
+            })
+        }
     }
 }

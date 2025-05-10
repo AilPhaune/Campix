@@ -12,9 +12,9 @@ use super::{
     fs::virt::devfs::{fseek_helper, DevFs, DevFsDriver, DevFsHook, DevFsHookKind},
     pci::PciDevice,
     vfs::{
-        arcrwb_new_from_box, Arcrwb, CharacterDevice, FileStat, FileSystem, VfsError, VfsFile,
-        VfsFileKind, FLAG_SYSTEM, FLAG_VIRTUAL_CHARACTER_DEVICE, OPEN_MODE_APPEND,
-        OPEN_MODE_BINARY, OPEN_MODE_READ, OPEN_MODE_WRITE,
+        arcrwb_new_from_box, Arcrwb, CharacterDevice, FileStat, FileSystem, FsSpecificFileData,
+        VfsError, VfsFile, VfsFileKind, FLAG_SYSTEM, FLAG_VIRTUAL_CHARACTER_DEVICE,
+        OPEN_MODE_APPEND, OPEN_MODE_BINARY, OPEN_MODE_READ, OPEN_MODE_WRITE,
     },
 };
 
@@ -327,6 +327,11 @@ impl VgaDriver {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct VgaFsSpecificFileData;
+
+impl FsSpecificFileData for VgaFsSpecificFileData {}
+
 const VGA: u64 = u64::from_be_bytes([0, 0, 0, 0, 0, b'v', b'g', b'a']);
 
 impl DevFsDriver for VgaDriver {
@@ -355,6 +360,7 @@ impl DevFsDriver for VgaDriver {
             0,
             dev_fs.os_id(),
             dev_fs.os_id(),
+            Arc::new(VgaFsSpecificFileData),
         );
         dev_fs.replace_hook(
             "vga".chars().collect(),
@@ -373,7 +379,7 @@ impl DevFsDriver for VgaDriver {
         hook: Arc<DevFsHook>,
         mode: u64,
     ) -> Result<u64, VfsError> {
-        if hook.file.name() != &['v', 'g', 'a'] {
+        if hook.file.name() != ['v', 'g', 'a'] {
             return Err(VfsError::PathNotFound);
         }
 
@@ -412,7 +418,7 @@ impl DevFsDriver for VgaDriver {
             size: self.size,
             is_directory: false,
             is_symlink: false,
-            permissions: permissions!(Owner:Read, Owner:Write).to_u32(),
+            permissions: permissions!(Owner:Read, Owner:Write).to_u64(),
             owner_id: 0,
             group_id: 0,
             created_at: 0,
