@@ -117,7 +117,9 @@ impl ExtendedBuddyPageAllocator {
 
     /// Allocates a block of at least `size` bytes, 4 KiB aligned, continuous, not zeroed
     pub fn alloc(&mut self, size: u64) -> Option<u64> {
-        let (addr, order) = self.allocator.alloc(size / buddy_alloc::PAGE_SIZE)?;
+        let (addr, order) = self
+            .allocator
+            .alloc(size.div_ceil(buddy_alloc::PAGE_SIZE))?;
         self.mark_used(addr, order);
         Some(addr)
     }

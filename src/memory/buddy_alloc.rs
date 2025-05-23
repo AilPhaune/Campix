@@ -1,16 +1,19 @@
+use core::ptr::NonNull;
+
 pub const PAGE_SIZE: u64 = 4096;
 
 // 2^28 * 4KiB = 1TiB
 const MAX_ORDER: u64 = 28;
 
 struct FreeBlock {
-    next: Option<*mut FreeBlock>,
+    next: Option<NonNull<FreeBlock>>,
+    order: u64,
 }
 
 pub struct BuddyPageAllocator {
     base_addr: u64,
     page_count: u64,
-    free_lists: [Option<*mut FreeBlock>; MAX_ORDER as usize + 1],
+    free_lists: [Option<NonNull<FreeBlock>>; MAX_ORDER as usize + 1],
     allocated_pages: u64,
 }
 
@@ -60,8 +63,11 @@ impl BuddyPageAllocator {
 
             let free_block = self.base_addr + curr_page * PAGE_SIZE;
             let free_block_ptr = free_block as *mut FreeBlock;
-            *free_block_ptr = FreeBlock { next: None };
-            self.free_lists[i as usize] = Some(free_block_ptr);
+            *free_block_ptr = FreeBlock {
+                next: None,
+                order: i,
+            };
+            self.free_lists[i as usize] = NonNull::new(free_block_ptr);
 
             curr_page += 1 << i;
         }
@@ -70,20 +76,22 @@ impl BuddyPageAllocator {
     /// Add a free block to the free list
     unsafe fn add_free_block(&mut self, addr: u64, order: u64) {
         assert_eq!(
-            (addr - self.base_addr) & ((PAGE_SIZE << order) - 1),
+            (addr - self.base_addr) % (PAGE_SIZE << order),
             0,
             "Address not properly aligned"
         );
 
         let block_ptr = addr as *mut FreeBlock;
         (*block_ptr).next = self.free_lists[order as usize].take();
-        self.free_lists[order as usize] = Some(block_ptr);
+        (*block_ptr).order = order;
+        self.free_lists[order as usize] = NonNull::new(block_ptr);
     }
 
     /// Removes a free block from the free list
-    fn consume(&mut self, order: u64) -> Option<*mut FreeBlock> {
+    fn consume(&mut self, order: u64) -> Option<NonNull<FreeBlock>> {
         if let Some(block) = self.free_lists[order as usize].take() {
-            self.free_lists[order as usize] = unsafe { (*block).next };
+            self.free_lists[order as usize] = unsafe { block.as_ref().next };
+            assert_eq!(order, unsafe { block.as_ref() }.order);
             Some(block)
         } else {
             None
@@ -93,6 +101,9 @@ impl BuddyPageAllocator {
     /// Allocate a block of at least `num_pages` pages.
     /// Returns (physical_address, order) if successful.
     pub fn alloc(&mut self, num_pages: u64) -> Option<(u64, u8)> {
+        if num_pages == 0 {
+            return None;
+        }
         let order = required_order(num_pages);
         if order > MAX_ORDER {
             return None;
@@ -110,7 +121,7 @@ impl BuddyPageAllocator {
         // Split blocks down to the desired order
         while current_order > order {
             if let Some(block) = self.consume(current_order) {
-                let block_addr = block as *mut _ as u64;
+                let block_addr = block.as_ptr() as *mut _ as u64;
                 let half_size = PAGE_SIZE << (current_order - 1);
 
                 let buddy1 = block_addr;
@@ -127,7 +138,7 @@ impl BuddyPageAllocator {
 
         // Now free_lists[order] should have a block
         if let Some(block) = self.consume(order) {
-            let block_addr = block as *mut _ as u64;
+            let block_addr = block.as_ptr() as *mut _ as u64;
 
             self.allocated_pages += 1 << order;
 
@@ -173,13 +184,13 @@ impl BuddyPageAllocator {
     unsafe fn remove_free_block(&mut self, addr: u64, order: u64) -> bool {
         let mut current = &mut self.free_lists[order as usize];
 
-        while let Some(block) = *current {
-            let block_addr = block as *mut _ as u64;
+        while let Some(mut block) = *current {
+            let block_addr = block.as_ptr() as *mut _ as u64;
             if block_addr == addr {
-                *current = (*block).next.take();
+                *current = block.as_mut().next.take();
                 return true;
             }
-            current = &mut (*block).next;
+            current = &mut block.as_mut().next;
         }
 
         false
