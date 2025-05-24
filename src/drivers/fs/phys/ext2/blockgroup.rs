@@ -1,13 +1,15 @@
 pub const BLOCK_GROUP_DESCRIPTOR_SIZE: u32 = 32;
 
 #[repr(C, packed)]
-struct RawBlockGroupDescriptor {
+pub struct RawBlockGroupDescriptor {
     pub block_usage_bitmap: u32,
     pub inode_usage_bitmap: u32,
     pub inode_table_block: u32,
     pub free_blocks_count: u16,
     pub free_inodes_count: u16,
     pub directory_count: u16,
+    pub padding: [u8; 2],
+    pub unused: [u8; 12],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -39,6 +41,19 @@ impl BlockGroupDescriptor {
             let raw =
                 unsafe { (bytes.as_ptr() as *const RawBlockGroupDescriptor).read_unaligned() };
             Some(BlockGroupDescriptor::of(raw))
+        }
+    }
+
+    pub fn to_raw(&self) -> RawBlockGroupDescriptor {
+        RawBlockGroupDescriptor {
+            block_usage_bitmap: self.block_usage_bitmap,
+            inode_usage_bitmap: self.inode_usage_bitmap,
+            inode_table_block: self.inode_table_block,
+            free_blocks_count: self.free_blocks_count,
+            free_inodes_count: self.free_inodes_count,
+            directory_count: self.directory_count,
+            padding: [0; 2],
+            unused: [0; 12],
         }
     }
 }

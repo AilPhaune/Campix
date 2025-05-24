@@ -47,6 +47,7 @@ impl FileHandle {
     }
 
     pub fn flush(&mut self, volume: &mut Ext2Volume) -> Result<(), VfsError> {
+        self.location.flush(volume)?;
         if let Some(info) = &mut self.block_cache_info {
             if info.dirty {
                 self.location.write_block(volume, &self.block_cache)?;
@@ -96,6 +97,41 @@ impl FileHandle {
         self.size = new_size;
         self.location.get_inode_mut().set_size(volume, new_size);
         volume.update_inode(self.get_inode())?;
+
+        self.flush(volume)?;
+        self.block_cache_info = None;
+        self.seek(volume, SeekPosition::FromStart(new_size))?;
+
+        Ok(())
+    }
+
+    pub fn grow(&mut self, volume: &mut Ext2Volume, new_size: u64) -> Result<(), VfsError> {
+        if new_size < self.size {
+            return Err(VfsError::InvalidArgument);
+        }
+        let curr_pos = self.offset;
+
+        let bs = volume.get_block_size() as u32;
+        let new_block_count: u32 = new_size
+            .div_ceil(bs as u64)
+            .try_into()
+            .map_err(|e| VfsError::DriverError(Box::new(e)))?;
+
+        let mut diff_alloc = 0;
+        while self.location.block_count() < new_block_count {
+            let allocated_block_count = self.location.allocate_new_block(volume)?;
+            diff_alloc += allocated_block_count;
+        }
+
+        self.size = new_size;
+        let inode = self.location.get_inode_mut();
+        inode.set_size(volume, new_size);
+        inode.sectors_count += diff_alloc * volume.sectors_per_block;
+        volume.update_inode(self.get_inode())?;
+
+        self.flush(volume)?;
+        self.block_cache_info = None;
+        self.seek(volume, SeekPosition::FromStart(curr_pos))?;
 
         Ok(())
     }
@@ -183,10 +219,10 @@ impl FileHandle {
             }
 
             while written < max_count {
+                self.flush(volume)?;
                 if !self.location.advance(volume)? {
                     break;
                 }
-                self.flush(volume)?;
                 let rem_copy = (max_count - written).min(info.size as u64);
                 if rem_copy != bs {
                     // If not writing a full block, we need to update the block cache

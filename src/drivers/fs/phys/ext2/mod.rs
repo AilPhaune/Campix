@@ -7,7 +7,7 @@ use alloc::{
     vec::Vec,
 };
 use balloc::BlockAllocator;
-use blockgroup::{BlockGroupDescriptor, BLOCK_GROUP_DESCRIPTOR_SIZE};
+use blockgroup::{BlockGroupDescriptor, RawBlockGroupDescriptor, BLOCK_GROUP_DESCRIPTOR_SIZE};
 use file::{Directory, FileHandle};
 use inode::{Inode, InodeReadingLocation, InodeType, RawInode};
 use lru::LruCache;
@@ -22,7 +22,7 @@ use crate::{
     drivers::vfs::{
         default_get_file_implementation, Arcrwb, BlockDevice, FileHandleAllocator, FileStat,
         FileSystem, FsSpecificFileData, SeekPosition, Vfs, VfsError, VfsFile, VfsFileKind,
-        WeakArcrwb, OPEN_MODE_APPEND, OPEN_MODE_BINARY, OPEN_MODE_READ, OPEN_MODE_TRUNCATE,
+        WeakArcrwb, OPEN_MODE_APPEND, OPEN_MODE_BINARY, OPEN_MODE_NO_RESIZE, OPEN_MODE_READ,
         OPEN_MODE_WRITE,
     },
 };
@@ -68,6 +68,7 @@ pub struct Ext2Volume {
     superblock: Superblock,
 
     block_size: u32,
+    sectors_per_block: u32,
     block_count: u32,
 
     block_group_count: u32,
@@ -120,7 +121,6 @@ impl Ext2Volume {
         if (device.get_open_mode() & OPEN_MODE_BINARY) == 0
             || (device.get_open_mode() & OPEN_MODE_READ) == 0
             || (device.get_open_mode() & OPEN_MODE_APPEND) == OPEN_MODE_APPEND
-            || (device.get_open_mode() & OPEN_MODE_TRUNCATE) == OPEN_MODE_TRUNCATE
         {
             return Err(VfsError::InvalidOpenMode);
         }
@@ -133,6 +133,7 @@ impl Ext2Volume {
         }
         let block_size = 1024u32 << superblock.log_block_size;
         let block_count = superblock.blocks_count;
+        let sectors_per_block = block_size / 512;
 
         if stats.size != (block_size as u64) * (block_count as u64) {
             return Err(Ext2Error::BadDeviceSize {
@@ -206,6 +207,7 @@ impl Ext2Volume {
             read_only,
             superblock,
             block_size,
+            sectors_per_block,
             block_count,
             block_group_count,
             blocks_per_group,
@@ -468,7 +470,7 @@ impl Ext2Volume {
         self.device.seek(SeekPosition::FromStart(1024))?;
         self.device.write(&buffer)?;
 
-        for backup_group in self.get_backup_groups().as_mut() {
+        for backup_group in self.get_backup_groups().as_mut().skip(1) {
             let lba = (backup_group as u64) * (self.blocks_per_group as u64) + 1;
             self.device
                 .seek(SeekPosition::FromStart(self.block_size as u64 * lba))?;
@@ -492,28 +494,16 @@ impl Ext2Volume {
         let block_index = byte_index / self.block_size as usize;
         let offset_in_block = byte_index % self.block_size as usize;
 
-        let start_byte = if self.block_size == 1024 {
-            2048
-        } else {
-            self.block_size as u64
-        };
-
         let mut buffer = alloc::vec![0u8; self.block_size as usize];
         unsafe {
-            // Write in primary table
-            let primary = start_byte / self.block_size as u64 + (block_index as u64);
-            self.read_block(primary, &mut buffer)?;
-            (buffer.as_mut_ptr().add(offset_in_block) as *mut BlockGroupDescriptor)
-                .write_unaligned(descriptor);
-            self.write_block(primary, &buffer)?;
-
             for backup_group in self.get_backup_groups().as_mut() {
                 let backup = (backup_group as u64) * (self.blocks_per_group as u64)
                     + (block_index as u64)
                     + 2; // Because superblock is at +1
+
                 self.read_block(backup, &mut buffer)?;
-                (buffer.as_mut_ptr().add(offset_in_block) as *mut BlockGroupDescriptor)
-                    .write_unaligned(descriptor);
+                (buffer.as_mut_ptr().add(offset_in_block) as *mut RawBlockGroupDescriptor)
+                    .write_unaligned(descriptor.to_raw());
                 self.write_block(backup, &buffer)?;
             }
         }
@@ -586,6 +576,17 @@ impl Ext2Volume {
         allocator.write_dirty(self)?;
         self.set_block_group_descriptor(group, allocator.consume())?;
         Ok(())
+    }
+
+    pub fn alloc_block_any(&mut self) -> Result<u32, VfsError> {
+        for group in 1..self.block_group_count {
+            if let Some(allocator) = self.get_block_allocator_for_group(group)? {
+                if let Ok(block) = allocator.alloc_block() {
+                    return Ok(block);
+                }
+            }
+        }
+        Err(VfsError::OutOfSpace)
     }
 }
 
@@ -840,14 +841,6 @@ impl FileSystem for Ext2Volume {
             .downcast_ref::<Ext2FsSpecificFileData>()
             .ok_or(VfsError::FileSystemMismatch)?;
 
-        // TODO: Write support
-        if mode & OPEN_MODE_APPEND != 0 {
-            return Err(VfsError::InvalidOpenMode);
-        }
-        if mode & OPEN_MODE_TRUNCATE != 0 {
-            return Err(VfsError::InvalidOpenMode);
-        }
-
         match &data.value {
             Either::A(inode) => match file.kind() {
                 VfsFileKind::File => {
@@ -861,6 +854,14 @@ impl FileSystem for Ext2Volume {
     }
 
     fn fclose(&mut self, handle: u64) -> Result<(), VfsError> {
+        let data = unsafe {
+            &mut *self
+                .handles
+                .get_handle_data::<FileHandle>(handle)
+                .ok_or(VfsError::BadHandle)?
+        };
+        data.flush(self)?;
+
         self.handles.dealloc_file_handle::<FileHandle>(handle);
         Ok(())
     }
@@ -899,7 +900,23 @@ impl FileSystem for Ext2Volume {
         if data.get_open_mode() & OPEN_MODE_WRITE == 0 {
             return Err(VfsError::ActionNotAllowed);
         }
-        data.write(self, buf)
+        let checked_buf = if data.get_open_mode() & OPEN_MODE_NO_RESIZE == OPEN_MODE_NO_RESIZE {
+            let pos = data.get_position();
+            let max_pos = data.get_size();
+            if pos > max_pos {
+                return Err(VfsError::ActionNotAllowed);
+            }
+            &buf[0..(max_pos - pos) as usize]
+        } else {
+            let pos = data.get_position();
+            let max_pos = data.get_size();
+            let end = pos + buf.len() as u64;
+            if end > max_pos {
+                data.grow(self, end)?;
+            }
+            buf
+        };
+        data.write(self, checked_buf)
     }
 
     fn ftruncate(&mut self, handle: u64) -> Result<u64, VfsError> {
@@ -910,6 +927,9 @@ impl FileSystem for Ext2Volume {
                 .ok_or(VfsError::BadHandle)?
         };
         if data.get_open_mode() & OPEN_MODE_WRITE == 0 {
+            return Err(VfsError::ActionNotAllowed);
+        }
+        if data.get_open_mode() & OPEN_MODE_NO_RESIZE == OPEN_MODE_NO_RESIZE {
             return Err(VfsError::ActionNotAllowed);
         }
         data.truncate(self, data.get_position())?;
@@ -930,7 +950,6 @@ impl FileSystem for Ext2Volume {
     }
 
     fn fsync(&mut self, _handle: u64) -> Result<(), VfsError> {
-        // TODO: Write support
         Err(VfsError::ActionNotAllowed)
     }
 

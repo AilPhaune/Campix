@@ -9,7 +9,7 @@ use data::{
     file::{DirectoryEntry, File},
 };
 use drivers::{
-    fs::phys::ext2::Ext2Volume,
+    fs::phys::ext2::{inode::CachedInodeReadingLocation, Ext2Volume},
     pci,
     vfs::{get_vfs, SeekPosition, OPEN_MODE_BINARY, OPEN_MODE_READ, OPEN_MODE_WRITE},
 };
@@ -89,13 +89,27 @@ pub fn _start(obsiboot_ptr: u64) -> ! {
                 OPEN_MODE_READ | OPEN_MODE_WRITE | OPEN_MODE_BINARY,
             )
             .unwrap();
-            let ext2 = Ext2Volume::from_device(
+            let mut ext2 = Ext2Volume::from_device(
                 file,
                 NonZeroUsize::new(1024 * 1024).unwrap(),
                 NonZeroUsize::new(1024 * 1024).unwrap(),
             )
             .unwrap();
             println!("{:#?}", ext2);
+
+            // debug inode 12
+            let inode = ext2.get_inode(12).unwrap();
+            println!("{:#?}", inode);
+            println!("Traversing inode blocks:");
+            let mut loc = CachedInodeReadingLocation::new(&ext2, inode).unwrap();
+            loop {
+                let blk = loc.current_block_idx();
+                let block = loc.get_next_block();
+                println!("{}: {:?}", blk, block);
+                if !loc.advance(&mut ext2).unwrap_or(false) {
+                    break;
+                }
+            }
 
             let vfs = get_vfs();
             let mut wguard = vfs.write();
@@ -112,15 +126,17 @@ pub fn _start(obsiboot_ptr: u64) -> ! {
 
         {
             let mut file = File::open("/system/aaa", OPEN_MODE_READ | OPEN_MODE_WRITE).unwrap();
-            let mut buffer = alloc_boxed_slice(file.stats().unwrap().size as usize);
-            let read = file.read(&mut buffer).unwrap() as usize;
-            hexdump(&buffer[0..read]);
 
-            buffer.fill(buffer[0] + 1);
             file.seek(SeekPosition::FromStart(0)).unwrap();
-            file.write(&buffer[0..read.min(5)]).unwrap();
+
+            let mut buffer = alloc_boxed_slice(4 * 1024 * 1024);
+            for (i, v) in buffer.iter_mut().enumerate() {
+                *v = b'A' + (i % 26) as u8;
+            }
+            *buffer.last_mut().unwrap() = b'\n';
+
+            file.write(&buffer).unwrap();
             file.flush().unwrap();
-            file.truncate().unwrap();
         }
 
         {

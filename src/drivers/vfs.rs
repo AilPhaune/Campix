@@ -51,6 +51,7 @@ pub enum VfsError {
     AlreadyMounted,
     OutOfSpace,
     InvalidArgument,
+    MaximumSizeReached,
     DriverError(Box<dyn core::fmt::Debug>),
 }
 
@@ -341,7 +342,7 @@ pub const OPEN_MODE_READ: u64 = 1 << 0;
 pub const OPEN_MODE_WRITE: u64 = 1 << 1;
 pub const OPEN_MODE_BINARY: u64 = 1 << 2;
 pub const OPEN_MODE_APPEND: u64 = 1 << 3;
-pub const OPEN_MODE_TRUNCATE: u64 = 1 << 4;
+pub const OPEN_MODE_NO_RESIZE: u64 = 1 << 4;
 
 #[derive(Debug, Clone, Copy)]
 pub enum SeekPosition {
