@@ -6,8 +6,9 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
+use balloc::BlockAllocator;
 use blockgroup::{BlockGroupDescriptor, BLOCK_GROUP_DESCRIPTOR_SIZE};
-use file::{Directory, FileReader};
+use file::{Directory, FileHandle};
 use inode::{Inode, InodeReadingLocation, InodeType, RawInode};
 use lru::LruCache;
 use spin::RwLock;
@@ -26,6 +27,7 @@ use crate::{
     },
 };
 
+pub mod balloc;
 pub mod blockgroup;
 pub mod file;
 pub mod inode;
@@ -69,12 +71,14 @@ pub struct Ext2Volume {
     block_count: u32,
 
     block_group_count: u32,
+    blocks_per_group: u32,
     block_group_descriptor_table: Vec<BlockGroupDescriptor>,
 
     inode_size: u16,
     inodes_per_block: u32,
 
     block_cache: RwLock<LruCache<u32, Box<[u8]>>>,
+    group_block_bitmap_caches: LruCache<u32, BlockAllocator>,
 
     // VFS stuff
     root_dir_fs_data: Option<Arc<Ext2FsSpecificFileData>>,
@@ -88,8 +92,11 @@ pub struct Ext2Volume {
 impl Ext2Volume {
     /// Implementation status:
     /// - ROFeatures::FileSize64: File inodes can use the higher 32bit of the size field
+    //  TODO: SparseDescriptorTables
     pub const fn supported_ro_features() -> ROFeatures {
-        *ROFeatures::empty().set(ROFeature::FileSize64)
+        *ROFeatures::empty()
+            .set(ROFeature::FileSize64)
+            .set(ROFeature::SparseDescriptorTables)
     }
 
     /// Implementation status:
@@ -99,13 +106,17 @@ impl Ext2Volume {
     }
 
     /// Implementation status:
-    /// TODO DirectoryEntriesHaveTypeField: Add support
+    //  TODO DirectoryEntriesHaveTypeField: Add support
     pub const fn supported_required_features() -> RequiredFeatures {
         *RequiredFeatures::empty().set(RequiredFeature::DirectoryEntriesHaveTypeField)
     }
 
     /// cache_size is in bytes, gets rounded up to the next integer multiple of the block size
-    pub fn from_device(device: File, cache_size: NonZeroUsize) -> Result<Self, VfsError> {
+    pub fn from_device(
+        device: File,
+        block_cache_size: NonZeroUsize,
+        block_usage_bitmap_cache_size: NonZeroUsize,
+    ) -> Result<Self, VfsError> {
         if (device.get_open_mode() & OPEN_MODE_BINARY) == 0
             || (device.get_open_mode() & OPEN_MODE_READ) == 0
             || (device.get_open_mode() & OPEN_MODE_APPEND) == OPEN_MODE_APPEND
@@ -170,6 +181,26 @@ impl Ext2Volume {
             .into());
         }
 
+        let blocks_per_group = superblock.blocks_per_group;
+        if blocks_per_group == 0 {
+            return Err(Ext2Error::BadSuperblock {
+                reason: "blocks_per_group == 0",
+                superblock: Box::new(superblock),
+            }
+            .into());
+        }
+
+        let block_lru = LruCache::new(
+            NonZeroUsize::new(block_cache_size.get().div_ceil(block_size as usize)).unwrap(), // Guaranteed to be non-zero
+        );
+
+        let block_bitmaps_lru = LruCache::new(
+            NonZeroUsize::new(block_usage_bitmap_cache_size.get().div_ceil(
+                BlockAllocator::group_bitmap_size(blocks_per_group, block_size),
+            ))
+            .unwrap(), // Guaranteed to be non-zero
+        );
+
         let mut ext2 = Self {
             device,
             read_only,
@@ -177,12 +208,12 @@ impl Ext2Volume {
             block_size,
             block_count,
             block_group_count,
+            blocks_per_group,
             block_group_descriptor_table: Vec::new(),
             inode_size,
             inodes_per_block,
-            block_cache: RwLock::new(LruCache::new(
-                NonZeroUsize::new(cache_size.get().div_ceil(block_size as usize)).unwrap(), // Guaranteed to be non-zero
-            )),
+            block_cache: RwLock::new(block_lru),
+            group_block_bitmap_caches: block_bitmaps_lru,
             // VFS stuff
             root_dir_fs_data: None,
             os_id: 0,
@@ -284,17 +315,45 @@ impl Ext2Volume {
         ))
     }
 
-    pub fn get_reader(&self, inode: Inode) -> Result<FileReader, VfsError> {
-        FileReader::new(self, inode)
+    pub fn update_inode(&mut self, inode: &Inode) -> Result<(), VfsError> {
+        let group = self.get_inode_group(inode.inode_i);
+        let index = self.get_inode_index_in_group(inode.inode_i);
+
+        let block = self
+            .block_group_descriptor_table
+            .get(group as usize)
+            .ok_or(Ext2Error::BadBlockGroupDescriptorTable)?
+            .inode_table_block;
+
+        let block_index = index / self.inodes_per_block;
+        let offset_in_block = (index % self.inodes_per_block) * (self.inode_size as u32);
+
+        let mut buffer = alloc::vec![0u8; self.block_size as usize];
+        self.read_block((block + block_index) as u64, &mut buffer)?;
+        unsafe {
+            (buffer.as_ptr().add(offset_in_block as usize) as *mut RawInode)
+                .write_unaligned(inode.get_raw())
+        };
+        self.write_block((block + block_index) as u64, &buffer)?;
+
+        Ok(())
     }
 
-    fn get_file_for_inode(&self, inode_i: u32, name: Vec<char>) -> Result<VfsFile, VfsError> {
+    pub fn get_file_handle(&mut self, inode: Inode, mode: u64) -> Result<FileHandle, VfsError> {
+        FileHandle::new(self, inode, mode)
+    }
+
+    fn get_file_for_inode(&mut self, inode_i: u32, name: Vec<char>) -> Result<VfsFile, VfsError> {
         let inode = self.get_inode(inode_i)?;
 
         let size = inode.get_size(self);
         let (data, kind) = match inode.inode_type {
             InodeType::Directory => (
-                Either::new_right(Directory::new(self, inode)?),
+                Either::new_right(Directory::new(
+                    self,
+                    inode,
+                    OPEN_MODE_BINARY | OPEN_MODE_READ,
+                )?),
                 VfsFileKind::Directory,
             ),
             InodeType::File => (Either::new_left(inode), VfsFileKind::File),
@@ -314,10 +373,247 @@ impl Ext2Volume {
             Arc::new(Ext2FsSpecificFileData { value: data }),
         ))
     }
+
+    pub fn get_block_group_descriptor(&self, group: u32) -> Option<BlockGroupDescriptor> {
+        self.block_group_descriptor_table
+            .get(group as usize)
+            .cloned()
+    }
+
+    pub fn block_group_contains_metadata_backup(&self, group: u32) -> bool {
+        #[inline(always)]
+        fn is_pow(a: u32, b: u32) -> bool {
+            let mut num = b;
+            while a > num {
+                num = match num.checked_mul(b) {
+                    Some(v) => v,
+                    None => return false,
+                };
+            }
+            num == a
+        }
+        !self
+            .superblock
+            .get_ro_features()
+            .has(ROFeature::SparseDescriptorTables)
+            || (group <= 1 || is_pow(group, 3) || is_pow(group, 5) || is_pow(group, 7))
+    }
+
+    fn get_backup_groups(&self) -> Box<dyn Iterator<Item = u32>> {
+        if self
+            .superblock
+            .get_ro_features()
+            .has(ROFeature::SparseDescriptorTables)
+        {
+            if self.block_group_count <= 1 {
+                return Box::new(0..=self.block_group_count);
+            }
+            let mut vec: Vec<u32> = alloc::vec![0, 1];
+            let mut pow3: u32 = 1;
+            let mut pow5: u32 = 1;
+            let mut pow7: u32 = 1;
+            loop {
+                pow3 = match pow3.checked_mul(3) {
+                    None => break,
+                    Some(v) => {
+                        if v > self.block_group_count {
+                            break;
+                        }
+                        vec.push(v);
+                        v
+                    }
+                }
+            }
+            loop {
+                pow5 = match pow5.checked_mul(5) {
+                    None => break,
+                    Some(v) => {
+                        if v > self.block_group_count {
+                            break;
+                        }
+                        vec.push(v);
+                        v
+                    }
+                }
+            }
+            loop {
+                pow7 = match pow7.checked_mul(7) {
+                    None => break,
+                    Some(v) => {
+                        if v > self.block_group_count {
+                            break;
+                        }
+                        vec.push(v);
+                        v
+                    }
+                }
+            }
+            Box::new(vec.into_iter())
+        } else {
+            return Box::new(0..self.block_group_descriptor_table.len() as u32);
+        }
+    }
+
+    pub fn set_superblock(&mut self, superblock: Superblock) -> Result<(), VfsError> {
+        if self.read_only {
+            return Err(VfsError::ActionNotAllowed);
+        }
+        self.superblock = superblock.clone();
+
+        let mut buffer = alloc::vec![0u8; size_of::<Superblock>()];
+        unsafe {
+            (buffer.as_mut_ptr() as *mut Superblock).write_unaligned(superblock);
+        }
+
+        self.device.seek(SeekPosition::FromStart(1024))?;
+        self.device.write(&buffer)?;
+
+        for backup_group in self.get_backup_groups().as_mut() {
+            let lba = (backup_group as u64) * (self.blocks_per_group as u64) + 1;
+            self.device
+                .seek(SeekPosition::FromStart(self.block_size as u64 * lba))?;
+            self.device.write(&buffer)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn set_block_group_descriptor(
+        &mut self,
+        group: u32,
+        descriptor: BlockGroupDescriptor,
+    ) -> Result<(), VfsError> {
+        if self.read_only {
+            return Err(VfsError::ActionNotAllowed);
+        }
+        self.block_group_descriptor_table[group as usize] = descriptor;
+
+        let byte_index = (group as usize) * (BLOCK_GROUP_DESCRIPTOR_SIZE as usize);
+        let block_index = byte_index / self.block_size as usize;
+        let offset_in_block = byte_index % self.block_size as usize;
+
+        let start_byte = if self.block_size == 1024 {
+            2048
+        } else {
+            self.block_size as u64
+        };
+
+        let mut buffer = alloc::vec![0u8; self.block_size as usize];
+        unsafe {
+            // Write in primary table
+            let primary = start_byte / self.block_size as u64 + (block_index as u64);
+            self.read_block(primary, &mut buffer)?;
+            (buffer.as_mut_ptr().add(offset_in_block) as *mut BlockGroupDescriptor)
+                .write_unaligned(descriptor);
+            self.write_block(primary, &buffer)?;
+
+            for backup_group in self.get_backup_groups().as_mut() {
+                let backup = (backup_group as u64) * (self.blocks_per_group as u64)
+                    + (block_index as u64)
+                    + 2; // Because superblock is at +1
+                self.read_block(backup, &mut buffer)?;
+                (buffer.as_mut_ptr().add(offset_in_block) as *mut BlockGroupDescriptor)
+                    .write_unaligned(descriptor);
+                self.write_block(backup, &buffer)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn get_block_allocator_for_group<'a: 'b, 'b>(
+        // explicit lifetime because we make some unsafe shit to bypass ass borrow checker who can't see that `self.get_block_group_descriptor(group)` does NOT try to borrow self immutably while it's being mutably borrowed because the mutable borrow either isn't used anymore, or has been returned
+        &'a mut self,
+        group: u32,
+    ) -> Result<Option<&'b mut BlockAllocator>, VfsError> {
+        if self.read_only {
+            return Ok(None);
+        }
+
+        if let Some(cached) = self.group_block_bitmap_caches.get_mut(&group) {
+            // Safe because we know that we're immediately returning the mutable reference, and self can't be used while it's borrowed
+            return Ok(Some(unsafe { &mut *(cached as *mut BlockAllocator) }));
+        }
+
+        let Some(descriptor) = self.get_block_group_descriptor(group) else {
+            return Ok(None);
+        };
+
+        let min_block_inclusive = group * self.blocks_per_group + 1;
+        let max_block_exclusive =
+            (min_block_inclusive + self.blocks_per_group).min(self.block_count);
+        let blocks = max_block_exclusive - min_block_inclusive;
+
+        let bitmap_begin_inclusive = descriptor.block_usage_bitmap;
+        let bitmap_bytes = blocks.div_ceil(8);
+        let bitmap_blocks = bitmap_bytes.div_ceil(self.block_size);
+        let bitmap_end_exclusive = bitmap_begin_inclusive + bitmap_blocks;
+
+        let mut allocator = BlockAllocator::new(
+            min_block_inclusive,
+            max_block_exclusive,
+            bitmap_begin_inclusive,
+            bitmap_end_exclusive,
+            self.block_size,
+            descriptor,
+        );
+        allocator.read_all(self)?;
+
+        if let Some(evicted) = self.group_block_bitmap_caches.push(group, allocator) {
+            self.handle_evicted_block_bitmap_cache(evicted.0, evicted.1)?;
+        }
+
+        Ok(self.group_block_bitmap_caches.get_mut(&group))
+    }
+
+    pub fn flush_block_bitmap_cache(&mut self, group: u32) -> Result<(), VfsError> {
+        if let Some(mut allocator) = self.group_block_bitmap_caches.pop(&group) {
+            let diff = *allocator.get_diff_usage();
+            *allocator.get_diff_usage() = 0;
+
+            let mut superblock = self.get_superblock().clone();
+            superblock.unallocated_blocks = ((superblock.unallocated_blocks as i64) - diff) as u32;
+            self.handle_evicted_block_bitmap_cache(group, allocator)?;
+            self.set_superblock(superblock)?;
+        }
+        Ok(())
+    }
+
+    fn handle_evicted_block_bitmap_cache(
+        &mut self,
+        group: u32,
+        mut allocator: BlockAllocator,
+    ) -> Result<(), VfsError> {
+        allocator.write_dirty(self)?;
+        self.set_block_group_descriptor(group, allocator.consume())?;
+        Ok(())
+    }
 }
 
 impl BlockDevice for Ext2Volume {
     fn flush(&mut self) -> Result<(), VfsError> {
+        let groups = self
+            .group_block_bitmap_caches
+            .iter()
+            .map(|(k, _)| *k)
+            .collect::<Vec<_>>();
+
+        let mut total_diff = 0;
+
+        for group in groups {
+            if let Some(mut allocator) = self.group_block_bitmap_caches.pop(&group) {
+                let diff = *allocator.get_diff_usage();
+                *allocator.get_diff_usage() = 0;
+
+                total_diff += diff;
+                self.handle_evicted_block_bitmap_cache(group, allocator)?;
+            }
+        }
+
+        let mut superblock = self.get_superblock().clone();
+        superblock.unallocated_blocks =
+            ((superblock.unallocated_blocks as i64) - total_diff) as u32;
+        self.set_superblock(superblock)?;
+
         self.device.flush()
     }
 
@@ -355,7 +651,8 @@ impl BlockDevice for Ext2Volume {
         let read = self.device.read(&mut slice)?;
         buf[0..read as usize].copy_from_slice(&slice[0..read as usize]);
 
-        wguard.put(lba32, slice);
+        wguard.push(lba32, slice);
+
         Ok(read)
     }
 
@@ -366,19 +663,26 @@ impl BlockDevice for Ext2Volume {
         if self.read_only {
             return Err(VfsError::ActionNotAllowed);
         }
+        let mut wguard = self.block_cache.write();
+
         self.device
             .seek(SeekPosition::FromStart(self.block_size as u64 * lba))?;
         let written = self.device.write(&buf[0..self.block_size as usize])?;
 
         let lba32 = lba as u32;
 
-        let mut wguard = self.block_cache.write();
         if let Some(cached) = wguard.get_mut(&lba32) {
             cached.copy_from_slice(&buf[0..written as usize]);
             return Ok(self.block_size as u64);
         }
 
         Ok(written)
+    }
+}
+
+impl Drop for Ext2Volume {
+    fn drop(&mut self) {
+        let _ = self.flush();
     }
 }
 
@@ -390,19 +694,19 @@ pub struct Ext2FsSpecificFileData {
 impl FsSpecificFileData for Ext2FsSpecificFileData {}
 
 impl FileSystem for Ext2Volume {
-    fn os_id(&self) -> u64 {
+    fn os_id(&mut self) -> u64 {
         self.os_id
     }
 
-    fn fs_type(&self) -> String {
+    fn fs_type(&mut self) -> String {
         "ext2".to_string()
     }
 
-    fn host_block_device(&self) -> Option<Arcrwb<dyn BlockDevice>> {
+    fn host_block_device(&mut self) -> Option<Arcrwb<dyn BlockDevice>> {
         None
     }
 
-    fn get_root(&self) -> Result<VfsFile, VfsError> {
+    fn get_root(&mut self) -> Result<VfsFile, VfsError> {
         Ok(VfsFile::new(
             VfsFileKind::Directory,
             alloc::vec!['/'],
@@ -415,7 +719,7 @@ impl FileSystem for Ext2Volume {
         ))
     }
 
-    fn get_mount_point(&self) -> Result<Option<VfsFile>, VfsError> {
+    fn get_mount_point(&mut self) -> Result<Option<VfsFile>, VfsError> {
         Ok(Some(
             self.mount_point
                 .clone()
@@ -423,7 +727,7 @@ impl FileSystem for Ext2Volume {
         ))
     }
 
-    fn get_child(&self, file: &VfsFile, child: &[char]) -> Result<VfsFile, VfsError> {
+    fn get_child(&mut self, file: &VfsFile, child: &[char]) -> Result<VfsFile, VfsError> {
         if file.fs() != self.os_id() {
             return Err(VfsError::FileSystemMismatch);
         }
@@ -444,7 +748,7 @@ impl FileSystem for Ext2Volume {
         }
     }
 
-    fn list_children(&self, file: &VfsFile) -> Result<Vec<VfsFile>, VfsError> {
+    fn list_children(&mut self, file: &VfsFile) -> Result<Vec<VfsFile>, VfsError> {
         if file.fs() != self.os_id() {
             return Err(VfsError::FileSystemMismatch);
         }
@@ -492,22 +796,40 @@ impl FileSystem for Ext2Volume {
         self.os_id = os_id;
 
         self.root_dir_fs_data = Some(Arc::new(Ext2FsSpecificFileData {
-            value: Either::B(Directory::new(self, self.get_inode(2)?)?),
+            value: Either::B(Directory::new(
+                self,
+                self.get_inode(2)?,
+                OPEN_MODE_BINARY | OPEN_MODE_READ,
+            )?),
         }));
 
         self.get_root()
     }
 
     fn on_pre_unmount(&mut self) -> Result<bool, VfsError> {
-        // TODO: checks if remaining handles
-        Err(VfsError::ActionNotAllowed)
+        for handle in self
+            .handles
+            .iter()
+            .copied()
+            .collect::<Vec<u64>>()
+            .into_iter()
+        {
+            self.fflush(handle)?;
+            self.fclose(handle)?;
+        }
+        Ok(true)
     }
 
     fn on_unmount(&mut self) -> Result<(), VfsError> {
+        self.mount_point = None;
+        self.root_fs = None;
+        self.os_id = 0;
+        self.flush()?;
+        unsafe { self.device._close()? };
         Ok(())
     }
 
-    fn get_vfs(&self) -> Result<WeakArcrwb<Vfs>, VfsError> {
+    fn get_vfs(&mut self) -> Result<WeakArcrwb<Vfs>, VfsError> {
         self.root_fs.clone().ok_or(VfsError::FileSystemNotMounted)
     }
 
@@ -525,15 +847,13 @@ impl FileSystem for Ext2Volume {
         if mode & OPEN_MODE_TRUNCATE != 0 {
             return Err(VfsError::InvalidOpenMode);
         }
-        if mode & OPEN_MODE_WRITE != 0 {
-            return Err(VfsError::InvalidOpenMode);
-        }
 
         match &data.value {
             Either::A(inode) => match file.kind() {
-                VfsFileKind::File => Ok(self
-                    .handles
-                    .alloc_file_handle::<FileReader>(FileReader::new(self, inode.clone())?)),
+                VfsFileKind::File => {
+                    let handle = FileHandle::new(self, inode.clone(), mode)?;
+                    Ok(self.handles.alloc_file_handle::<FileHandle>(handle))
+                }
                 _ => Err(VfsError::NotFile),
             },
             Either::B(_) => Err(VfsError::NotFile),
@@ -541,7 +861,7 @@ impl FileSystem for Ext2Volume {
     }
 
     fn fclose(&mut self, handle: u64) -> Result<(), VfsError> {
-        self.handles.dealloc_file_handle::<FileReader>(handle);
+        self.handles.dealloc_file_handle::<FileHandle>(handle);
         Ok(())
     }
 
@@ -549,7 +869,7 @@ impl FileSystem for Ext2Volume {
         let data = unsafe {
             &mut *self
                 .handles
-                .get_handle_data::<FileReader>(handle)
+                .get_handle_data::<FileHandle>(handle)
                 .ok_or(VfsError::BadHandle)?
         };
         data.seek(self, position)?;
@@ -560,20 +880,53 @@ impl FileSystem for Ext2Volume {
         let data = unsafe {
             &mut *self
                 .handles
-                .get_handle_data::<FileReader>(handle)
+                .get_handle_data::<FileHandle>(handle)
                 .ok_or(VfsError::BadHandle)?
         };
-        data.read(self, buf, buf.len() as u64)
+        if data.get_open_mode() & OPEN_MODE_READ == 0 {
+            return Err(VfsError::ActionNotAllowed);
+        }
+        data.read(self, buf)
     }
 
-    fn fwrite(&mut self, _handle: u64, _buf: &[u8]) -> Result<u64, VfsError> {
-        // TODO: Write support
-        Err(VfsError::ActionNotAllowed)
+    fn fwrite(&mut self, handle: u64, buf: &[u8]) -> Result<u64, VfsError> {
+        let data = unsafe {
+            &mut *self
+                .handles
+                .get_handle_data::<FileHandle>(handle)
+                .ok_or(VfsError::BadHandle)?
+        };
+        if data.get_open_mode() & OPEN_MODE_WRITE == 0 {
+            return Err(VfsError::ActionNotAllowed);
+        }
+        data.write(self, buf)
     }
 
-    fn fflush(&mut self, _handle: u64) -> Result<(), VfsError> {
-        // TODO: Write support
-        Err(VfsError::ActionNotAllowed)
+    fn ftruncate(&mut self, handle: u64) -> Result<u64, VfsError> {
+        let data = unsafe {
+            &mut *self
+                .handles
+                .get_handle_data::<FileHandle>(handle)
+                .ok_or(VfsError::BadHandle)?
+        };
+        if data.get_open_mode() & OPEN_MODE_WRITE == 0 {
+            return Err(VfsError::ActionNotAllowed);
+        }
+        data.truncate(self, data.get_position())?;
+        Ok(data.get_size())
+    }
+
+    fn fflush(&mut self, handle: u64) -> Result<(), VfsError> {
+        let data = unsafe {
+            &mut *self
+                .handles
+                .get_handle_data::<FileHandle>(handle)
+                .ok_or(VfsError::BadHandle)?
+        };
+        if data.get_open_mode() & OPEN_MODE_WRITE == 0 {
+            return Err(VfsError::ActionNotAllowed);
+        }
+        data.flush(self)
     }
 
     fn fsync(&mut self, _handle: u64) -> Result<(), VfsError> {
@@ -585,7 +938,7 @@ impl FileSystem for Ext2Volume {
         let data = unsafe {
             &*self
                 .handles
-                .get_handle_data::<FileReader>(handle)
+                .get_handle_data::<FileHandle>(handle)
                 .ok_or(VfsError::BadHandle)?
         };
         let inode = data.get_inode();

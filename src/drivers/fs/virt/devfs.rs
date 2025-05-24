@@ -74,6 +74,7 @@ pub trait DevFsDriver: Send + Sync + Debug + AsAny {
     fn fclose(&mut self, dev_fs: &mut DevFs, handle: u64) -> Result<(), VfsError>;
     fn fread(&mut self, dev_fs: &mut DevFs, handle: u64, buf: &mut [u8]) -> Result<u64, VfsError>;
     fn fwrite(&mut self, dev_fs: &mut DevFs, handle: u64, buf: &[u8]) -> Result<u64, VfsError>;
+    fn ftruncate(&mut self, dev_fs: &mut DevFs, handle: u64) -> Result<u64, VfsError>;
     fn fflush(&mut self, dev_fs: &mut DevFs, handle: u64) -> Result<(), VfsError>;
     fn fsync(&mut self, dev_fs: &mut DevFs, handle: u64) -> Result<(), VfsError>;
     fn fstat(&mut self, dev_fs: &DevFs, handle: u64) -> Result<FileStat, VfsError>;
@@ -208,7 +209,7 @@ macro_rules! get_driver {
 }
 
 impl FileSystem for DevFs {
-    fn get_root(&self) -> Result<VfsFile, VfsError> {
+    fn get_root(&mut self) -> Result<VfsFile, VfsError> {
         Ok(VfsFile::new(
             VfsFileKind::Directory,
             alloc::vec!['/'],
@@ -219,7 +220,7 @@ impl FileSystem for DevFs {
         ))
     }
 
-    fn os_id(&self) -> u64 {
+    fn os_id(&mut self) -> u64 {
         self.os_id
     }
 
@@ -232,7 +233,7 @@ impl FileSystem for DevFs {
         Err(VfsError::ActionNotAllowed)
     }
 
-    fn get_child(&self, file: &VfsFile, child: &[char]) -> Result<VfsFile, VfsError> {
+    fn get_child(&mut self, file: &VfsFile, child: &[char]) -> Result<VfsFile, VfsError> {
         if file.fs() != self.os_id() {
             return Err(VfsError::FileSystemMismatch);
         }
@@ -245,7 +246,7 @@ impl FileSystem for DevFs {
         Ok(hook.file.clone())
     }
 
-    fn list_children(&self, file: &VfsFile) -> Result<Vec<VfsFile>, VfsError> {
+    fn list_children(&mut self, file: &VfsFile) -> Result<Vec<VfsFile>, VfsError> {
         if file.fs() != self.os_id() {
             return Err(VfsError::FileSystemMismatch);
         }
@@ -259,11 +260,11 @@ impl FileSystem for DevFs {
             .collect::<Vec<_>>())
     }
 
-    fn fs_type(&self) -> String {
+    fn fs_type(&mut self) -> String {
         "devices".to_string()
     }
 
-    fn get_file(&self, path: &[char]) -> Result<VfsFile, VfsError> {
+    fn get_file(&mut self, path: &[char]) -> Result<VfsFile, VfsError> {
         let mut traverse = PathTraverse::new_owned(path, self)?;
         loop {
             let result = traverse.find_next()?;
@@ -273,7 +274,7 @@ impl FileSystem for DevFs {
         }
     }
 
-    fn get_mount_point(&self) -> Result<Option<VfsFile>, VfsError> {
+    fn get_mount_point(&mut self) -> Result<Option<VfsFile>, VfsError> {
         Ok(Some(
             self.mnt
                 .as_ref()
@@ -282,7 +283,7 @@ impl FileSystem for DevFs {
         ))
     }
 
-    fn host_block_device(&self) -> Option<Arcrwb<dyn BlockDevice>> {
+    fn host_block_device(&mut self) -> Option<Arcrwb<dyn BlockDevice>> {
         None
     }
 
@@ -310,7 +311,7 @@ impl FileSystem for DevFs {
         Ok(())
     }
 
-    fn get_vfs(&self) -> Result<WeakArcrwb<Vfs>, VfsError> {
+    fn get_vfs(&mut self) -> Result<WeakArcrwb<Vfs>, VfsError> {
         Ok(self
             .root_fs
             .as_ref()
@@ -369,6 +370,13 @@ impl FileSystem for DevFs {
 
         let mut wguard = driver.write();
         (*wguard).fread(self, handle, buf)
+    }
+
+    fn ftruncate(&mut self, handle: u64) -> Result<u64, VfsError> {
+        let driver = get_driver!(self, handle);
+
+        let mut wguard = driver.write();
+        (*wguard).ftruncate(self, handle)
     }
 
     fn fflush(&mut self, handle: u64) -> Result<(), VfsError> {

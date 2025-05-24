@@ -72,6 +72,13 @@ impl<A, B> Either<A, B> {
         }
     }
 
+    pub fn referenced_mut(&mut self) -> Either<&mut A, &mut B> {
+        match self {
+            Either::A(v) => Either::A(v),
+            Either::B(v) => Either::B(v),
+        }
+    }
+
     pub fn get_left(self) -> Option<A> {
         match self {
             Either::A(v) => Some(v),

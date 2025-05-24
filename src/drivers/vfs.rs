@@ -3,7 +3,7 @@ use core::{alloc::Layout, any::Any, fmt::Debug};
 use alloc::{
     alloc::{alloc, dealloc},
     boxed::Box,
-    collections::{btree_map::Entry, BTreeMap, BTreeSet},
+    collections::{btree_map::Entry, btree_set, BTreeMap, BTreeSet},
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
@@ -49,6 +49,8 @@ pub enum VfsError {
     InvalidSeekPosition,
     BadHandle,
     AlreadyMounted,
+    OutOfSpace,
+    InvalidArgument,
     DriverError(Box<dyn core::fmt::Debug>),
 }
 
@@ -373,28 +375,28 @@ pub struct FileStat {
 
 pub trait FileSystem: Send + Sync + core::fmt::Debug + AsAny {
     /// Returns this file system's ID
-    fn os_id(&self) -> u64;
+    fn os_id(&mut self) -> u64;
 
     /// Returns the file system type
-    fn fs_type(&self) -> String;
+    fn fs_type(&mut self) -> String;
 
     /// Returns the block device used by the file system, None is applicable only to in-memory file systems
-    fn host_block_device(&self) -> Option<Arcrwb<dyn BlockDevice>>;
+    fn host_block_device(&mut self) -> Option<Arcrwb<dyn BlockDevice>>;
 
     /// Returns the root of the file system
-    fn get_root(&self) -> Result<VfsFile, VfsError>;
+    fn get_root(&mut self) -> Result<VfsFile, VfsError>;
 
     /// Returns the mount point of the file system, none for the absolute root
-    fn get_mount_point(&self) -> Result<Option<VfsFile>, VfsError>;
+    fn get_mount_point(&mut self) -> Result<Option<VfsFile>, VfsError>;
 
     /// Finds a child of the given file
-    fn get_child(&self, file: &VfsFile, child: &[char]) -> Result<VfsFile, VfsError>;
+    fn get_child(&mut self, file: &VfsFile, child: &[char]) -> Result<VfsFile, VfsError>;
 
     /// Lists the children of the given file if it is a directory
-    fn list_children(&self, file: &VfsFile) -> Result<Vec<VfsFile>, VfsError>;
+    fn list_children(&mut self, file: &VfsFile) -> Result<Vec<VfsFile>, VfsError>;
 
     /// Returns the file at the given path, from this file system's root
-    fn get_file(&self, path: &[char]) -> Result<VfsFile, VfsError>;
+    fn get_file(&mut self, path: &[char]) -> Result<VfsFile, VfsError>;
 
     /// Creates a child file at the given path
     fn create_child(
@@ -421,7 +423,7 @@ pub trait FileSystem: Send + Sync + core::fmt::Debug + AsAny {
     fn on_unmount(&mut self) -> Result<(), VfsError>;
 
     /// Gets the root file system
-    fn get_vfs(&self) -> Result<WeakArcrwb<Vfs>, VfsError>;
+    fn get_vfs(&mut self) -> Result<WeakArcrwb<Vfs>, VfsError>;
 
     /// Opens a file
     /// Returns the file handle
@@ -450,6 +452,10 @@ pub trait FileSystem: Send + Sync + core::fmt::Debug + AsAny {
 
     /// Gets stats of a file
     fn fstat(&self, handle: u64) -> Result<FileStat, VfsError>;
+
+    /// Truncates a file
+    /// Returns the new size
+    fn ftruncate(&mut self, handle: u64) -> Result<u64, VfsError>;
 }
 
 pub struct PathSplitter<'a> {
@@ -530,7 +536,7 @@ impl<'a> PathSplitter<'a> {
 
 pub struct PathTraverse<'a, 'b> {
     spliter: PathSplitter<'a>,
-    fs: Either<Arcrwb<dyn FileSystem>, &'b dyn FileSystem>,
+    fs: Either<Arcrwb<dyn FileSystem>, &'b mut dyn FileSystem>,
     curr: VfsFile,
 }
 
@@ -541,14 +547,14 @@ impl<'a, 'b> PathTraverse<'a, 'b> {
     ) -> Result<PathTraverse<'a, 'b>, VfsError> {
         Ok(PathTraverse {
             spliter: PathSplitter::new(path),
-            curr: fs.read().get_root()?,
+            curr: fs.write().get_root()?,
             fs: Either::new_left(fs.clone()),
         })
     }
 
     pub fn new_owned(
         path: &'a [char],
-        fs: &'b dyn FileSystem,
+        fs: &'b mut dyn FileSystem,
     ) -> Result<PathTraverse<'a, 'b>, VfsError> {
         Ok(PathTraverse {
             spliter: PathSplitter::new(path),
@@ -567,15 +573,15 @@ impl<'a, 'b> PathTraverse<'a, 'b> {
         }
         if let Some(fs) = self.curr.get_mounted_fs() {
             {
-                let guard = fs.read();
+                let mut guard = fs.write();
                 self.curr = guard.get_root()?;
             }
             self.fs = Either::new_left(fs.clone());
         }
 
         let part = self.spliter.next_part();
-        let next = self.fs.referenced().convert(
-            |fs| fs.read().get_child(&self.curr, part),
+        let next = self.fs.referenced_mut().convert(
+            |fs| fs.write().get_child(&self.curr, part),
             |fs| fs.get_child(&self.curr, part),
         )?;
 
@@ -768,17 +774,17 @@ impl Vfs {
 
         let id = guard.os_id();
 
-        {
-            let mut wguard = self.fs_by_id.write();
-            wguard.remove(&id);
-        }
-
         #[allow(clippy::never_loop)]
         while !guard.on_pre_unmount()? {
             // TODO: Let driver do their thing
             break;
         }
         guard.on_unmount()?;
+
+        {
+            let mut wguard = self.fs_by_id.write();
+            wguard.remove(&id);
+        }
 
         Ok(())
     }
@@ -805,7 +811,7 @@ impl<T: Any> AsAny for T {
 
 macro_rules! default_get_file_implementation {
     () => {
-        fn get_file(&self, path: &[char]) -> Result<VfsFile, VfsError> {
+        fn get_file(&mut self, path: &[char]) -> Result<VfsFile, VfsError> {
             let mut traverse = $crate::drivers::vfs::PathTraverse::new_owned(path, self)?;
             if traverse.is_done() {
                 return self.get_root();
@@ -822,19 +828,19 @@ macro_rules! default_get_file_implementation {
 pub(crate) use default_get_file_implementation;
 
 impl FileSystem for Vfs {
-    fn os_id(&self) -> u64 {
+    fn os_id(&mut self) -> u64 {
         1
     }
 
-    fn fs_type(&self) -> String {
+    fn fs_type(&mut self) -> String {
         "vfs".to_string()
     }
 
-    fn host_block_device(&self) -> Option<Arcrwb<dyn BlockDevice>> {
+    fn host_block_device(&mut self) -> Option<Arcrwb<dyn BlockDevice>> {
         None
     }
 
-    fn get_root(&self) -> Result<VfsFile, VfsError> {
+    fn get_root(&mut self) -> Result<VfsFile, VfsError> {
         Ok(VfsFile {
             kind: VfsFileKind::Directory,
             name: "/".chars().collect(),
@@ -845,11 +851,11 @@ impl FileSystem for Vfs {
         })
     }
 
-    fn get_mount_point(&self) -> Result<Option<VfsFile>, VfsError> {
+    fn get_mount_point(&mut self) -> Result<Option<VfsFile>, VfsError> {
         Ok(None)
     }
 
-    fn get_child(&self, file: &VfsFile, child: &[char]) -> Result<VfsFile, VfsError> {
+    fn get_child(&mut self, file: &VfsFile, child: &[char]) -> Result<VfsFile, VfsError> {
         if file.fs != self.os_id() {
             return Err(VfsError::FileSystemMismatch);
         }
@@ -860,7 +866,7 @@ impl FileSystem for Vfs {
             return file
                 .get_mounted_fs()
                 .ok_or(VfsError::FileSystemNotMounted)?
-                .read()
+                .write()
                 .get_child(file, child);
         }
 
@@ -887,7 +893,7 @@ impl FileSystem for Vfs {
                 }),
                 Some(fs) => {
                     let fs = fs.upgrade().ok_or(VfsError::UnknownError)?;
-                    let guard = fs.read();
+                    let mut guard = fs.write();
                     Ok(VfsFile {
                         kind: VfsFileKind::MountPoint {
                             mounted_fs: fs.clone(),
@@ -903,12 +909,12 @@ impl FileSystem for Vfs {
         }
     }
 
-    fn list_children(&self, file: &VfsFile) -> Result<Vec<VfsFile>, VfsError> {
+    fn list_children(&mut self, file: &VfsFile) -> Result<Vec<VfsFile>, VfsError> {
         if file.is_mount_point() {
             let fs = file
                 .get_mounted_fs()
                 .ok_or(VfsError::FileSystemNotMounted)?;
-            let guard = fs.read();
+            let mut guard = fs.write();
 
             let root = guard.get_root()?;
             return guard.list_children(&root);
@@ -920,8 +926,9 @@ impl FileSystem for Vfs {
             let fs = self
                 .get_fs_by_id(file.fs)
                 .ok_or(VfsError::FileSystemNotMounted)?;
-            return fs.read().list_children(file);
+            return fs.write().list_children(file);
         }
+        let os_id = self.os_id();
 
         let mut node = &self.mounting_points_manager.tree;
         let mut splitter = PathSplitter::new(file.name());
@@ -941,20 +948,20 @@ impl FileSystem for Vfs {
                     kind: VfsFileKind::Directory,
                     name: [file.name(), &['/'], k].concat(),
                     size: 0,
-                    parent_fs: self.os_id(),
-                    fs: self.os_id(),
+                    parent_fs: os_id,
+                    fs: os_id,
                     fs_specific: Arc::new(VfsSpecificFileData),
                 }),
                 Some(fs) => {
                     let fs = fs.upgrade()?;
-                    let os_id = fs.read().os_id();
+                    let os_id = fs.write().os_id();
                     Some(VfsFile {
                         kind: VfsFileKind::MountPoint {
                             mounted_fs: fs.clone(),
                         },
                         name: k.to_vec(),
                         size: 0,
-                        parent_fs: self.os_id(),
+                        parent_fs: os_id,
                         fs: os_id,
                         fs_specific: Arc::new(VfsSpecificFileData),
                     })
@@ -997,7 +1004,7 @@ impl FileSystem for Vfs {
         Err(VfsError::ActionNotAllowed)
     }
 
-    fn get_vfs(&self) -> Result<WeakArcrwb<Vfs>, VfsError> {
+    fn get_vfs(&mut self) -> Result<WeakArcrwb<Vfs>, VfsError> {
         Ok(self
             .root_fs
             .as_ref()
@@ -1040,6 +1047,10 @@ impl FileSystem for Vfs {
     fn fsync(&mut self, _handle: u64) -> Result<(), VfsError> {
         Err(VfsError::ActionNotAllowed)
     }
+
+    fn ftruncate(&mut self, _handle: u64) -> Result<u64, VfsError> {
+        Err(VfsError::ActionNotAllowed)
+    }
 }
 
 #[repr(C)]
@@ -1072,6 +1083,9 @@ impl FileHandleAllocator {
     /// # Safety
     /// Caller must ensure that the handle is valid and was allocated using `alloc_file_handle` with the same `T` type
     pub unsafe fn get_handle_data<T: Sized + Clone + Debug>(&self, handle: u64) -> Option<*mut T> {
+        if !self.handles.contains(&handle) {
+            return None;
+        }
         let handle_data = handle as *mut VfsHandleData<T>;
         Some(&mut (*handle_data).data as *mut T)
     }
@@ -1086,6 +1100,10 @@ impl FileHandleAllocator {
             };
             self.handles.remove(&handle);
         }
+    }
+
+    pub fn iter(&self) -> btree_set::Iter<u64> {
+        self.handles.iter()
     }
 }
 

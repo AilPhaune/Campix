@@ -740,6 +740,13 @@ impl DevFsDriver for PataDevfsDriver {
         Ok(bytes_written as u64)
     }
 
+    fn ftruncate(&mut self, _dev_fs: &mut DevFs, handle: u64) -> Result<u64, VfsError> {
+        if !self.handles.contains(&handle) {
+            return Err(VfsError::BadHandle);
+        }
+        Err(VfsError::ActionNotAllowed)
+    }
+
     fn fseek(
         &mut self,
         dev_fs: &mut DevFs,
@@ -793,5 +800,11 @@ impl DevFsDriver for PataDevfsDriver {
             modified_at: 0,
             flags: FLAG_PHYSICAL_BLOCK_DEVICE | FLAG_PARTITIONED_DEVICE,
         })
+    }
+}
+
+impl Drop for PataDevfsDriver {
+    fn drop(&mut self) {
+        self.handles.clear();
     }
 }

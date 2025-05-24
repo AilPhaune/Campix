@@ -46,7 +46,7 @@ isr_stub_%+%1:
     
     ; Args
     mov rdi, %1
-    mov rsi, [rsp + 9*8]
+    lea rsi, [rsp + 9*8]
 
     align_stack
     call idt_exception_handler
@@ -60,6 +60,7 @@ isr_stub_%+%1:
 isr_stub_%+%1:
     save_regs
     mov rdi, %1
+    lea rsi, [rsp + 9*8]
     align_stack
     call idt_exception_handler
     pop_stack
@@ -72,6 +73,7 @@ isr_stub_%+%1:
     save_regs
     push 0
     mov rdi, %1
+    lea rsi, [rsp + 9*8]
     align_stack
     call idt_irq_handler
     pop_stack

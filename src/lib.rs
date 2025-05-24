@@ -11,7 +11,7 @@ use data::{
 use drivers::{
     fs::phys::ext2::Ext2Volume,
     pci,
-    vfs::{get_vfs, OPEN_MODE_BINARY, OPEN_MODE_READ},
+    vfs::{get_vfs, SeekPosition, OPEN_MODE_BINARY, OPEN_MODE_READ, OPEN_MODE_WRITE},
 };
 use memory::mem::OsMemoryRegion;
 use obsiboot::ObsiBootKernelParameters;
@@ -56,9 +56,13 @@ pub fn _start(obsiboot_ptr: u64) -> ! {
             obsiboot.page_tables_page_allocator_current_free_page as u64,
             obsiboot.page_tables_page_allocator_last_usable_page as u64,
         );
+        println!("Paging initialized");
 
         gdt::init_gdtr();
+        println!("GDT initialized");
+
         interrupts::init();
+        println!("Interrupts initialized");
 
         memory::mem::init(
             physical_to_virtual(obsiboot.ptr_to_memory_layout as u64) as *const OsMemoryRegion,
@@ -66,7 +70,10 @@ pub fn _start(obsiboot_ptr: u64) -> ! {
             obsiboot.pml4_base_address as u64,
             obsiboot.usable_kernel_memory_start as u64,
         );
+        println!("Memory allocator initialized");
+
         vesa::parse_current_mode(&obsiboot);
+        println!("VESA initialized");
 
         {
             println!("\nEnumerating PCI devices:");
@@ -77,9 +84,17 @@ pub fn _start(obsiboot_ptr: u64) -> ! {
         }
 
         {
-            let file = File::open("/dev/pata_pm_p0", OPEN_MODE_READ | OPEN_MODE_BINARY).unwrap();
-            let ext2 = Ext2Volume::from_device(file, NonZeroUsize::new(10 * 1024 * 1024).unwrap())
-                .unwrap();
+            let file = File::open(
+                "/dev/pata_pm_p0",
+                OPEN_MODE_READ | OPEN_MODE_WRITE | OPEN_MODE_BINARY,
+            )
+            .unwrap();
+            let ext2 = Ext2Volume::from_device(
+                file,
+                NonZeroUsize::new(1024 * 1024).unwrap(),
+                NonZeroUsize::new(1024 * 1024).unwrap(),
+            )
+            .unwrap();
             println!("{:#?}", ext2);
 
             let vfs = get_vfs();
@@ -96,10 +111,24 @@ pub fn _start(obsiboot_ptr: u64) -> ! {
         }
 
         {
-            let file = File::open("/system/obsiboot.conf", OPEN_MODE_READ).unwrap();
+            let mut file = File::open("/system/aaa", OPEN_MODE_READ | OPEN_MODE_WRITE).unwrap();
             let mut buffer = alloc_boxed_slice(file.stats().unwrap().size as usize);
             let read = file.read(&mut buffer).unwrap() as usize;
             hexdump(&buffer[0..read]);
+
+            buffer.fill(buffer[0] + 1);
+            file.seek(SeekPosition::FromStart(0)).unwrap();
+            file.write(&buffer[0..read.min(5)]).unwrap();
+            file.flush().unwrap();
+            file.truncate().unwrap();
+        }
+
+        {
+            let vfs = get_vfs();
+            let mut wguard = vfs.write();
+            wguard
+                .unmount(&"system".chars().collect::<Vec<char>>())
+                .unwrap();
         }
 
         kmain(obsiboot);

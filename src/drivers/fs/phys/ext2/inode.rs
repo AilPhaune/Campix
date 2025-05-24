@@ -1,4 +1,4 @@
-use alloc::boxed::Box;
+use alloc::{boxed::Box, format};
 
 use crate::{
     data::alloc_boxed_slice,
@@ -56,6 +56,7 @@ pub struct Inode {
     pub extended_attribute_block: u32,
     pub size_hi_or_dir_acl: u32,
     pub fragment_block: u32,
+    pub ossv2: [u8; 12],
 
     // The inode number
     pub inode_i: u32,
@@ -91,8 +92,35 @@ impl Inode {
             extended_attribute_block: raw_inode.extended_attribute_block,
             size_hi_or_dir_acl: raw_inode.size_hi_or_dir_acl,
             fragment_block: raw_inode.fragment_block,
+            ossv2: raw_inode.ossv2,
 
             inode_i,
+        }
+    }
+
+    pub fn get_raw(&self) -> RawInode {
+        RawInode {
+            type_and_permissions: self.inode_type as u16 | self.permissions.get(),
+            uid: self.uid,
+            size_lo: self.size_lo,
+            atime: self.atime,
+            ctime: self.ctime,
+            mtime: self.mtime,
+            dtime: self.dtime,
+            gid: self.gid,
+            links_count: self.links_count,
+            sectors_count: self.sectors_count,
+            flags: self.flags.get(),
+            ossv1: self.ossv1,
+            direct_block_pointers: self.direct_block_pointers,
+            single_indirect_block_pointer: self.single_indirect_block_pointer,
+            double_indirect_block_pointer: self.double_indirect_block_pointer,
+            triple_indirect_block_pointer: self.triple_indirect_block_pointer,
+            generation_number: self.generation_number,
+            extended_attribute_block: self.extended_attribute_block,
+            size_hi_or_dir_acl: self.size_hi_or_dir_acl,
+            fragment_block: self.fragment_block,
+            ossv2: self.ossv2,
         }
     }
 
@@ -107,6 +135,18 @@ impl Inode {
         } else {
             self.size_lo as u64
         }
+    }
+
+    pub fn set_size(&mut self, volume: &Ext2Volume, size: u64) {
+        if self.inode_type == InodeType::File
+            && volume
+                .get_superblock()
+                .get_ro_features()
+                .has(ROFeature::FileSize64)
+        {
+            self.size_hi_or_dir_acl = (size >> 32) as u32;
+        }
+        self.size_lo = size as u32;
     }
 }
 
@@ -284,15 +324,21 @@ pub struct CachedInodeReadingLocation {
     location: InodeReadingLocation,
     inode: Inode,
     max_block: u32,
+    block_size: u64,
 
     table1: Box<[u8]>,
     table1_addr: u32,
+    table1_dirty: bool,
 
     table2: Box<[u8]>,
     table2_addr: u32,
+    table2_dirty: bool,
 
     table3: Box<[u8]>,
     table3_addr: u32,
+    table3_dirty: bool,
+
+    inode_dirty: bool,
 }
 
 impl CachedInodeReadingLocation {
@@ -317,16 +363,47 @@ impl CachedInodeReadingLocation {
             table1,
             table2,
             table3,
+            table1_dirty: false,
+            table2_dirty: false,
+            table3_dirty: false,
+            block_size: size,
+            inode_dirty: false,
         })
     }
 
-    fn check_table1(&mut self, ext2: &Ext2Volume) -> Result<(), VfsError> {
+    fn save_if_addresses_differ(
+        ext2: &mut Ext2Volume,
+        table: &[u8],
+        current_addr: u32,
+        to_load_addr: u32,
+        dirty: bool,
+    ) -> Result<(), VfsError> {
+        if dirty
+            && current_addr != to_load_addr
+            && ext2.write_block(current_addr as u64, table)? != ext2.block_size as u64
+        {
+            return Err(VfsError::UnknownError);
+        };
+        Ok(())
+    }
+
+    fn check_table1(&mut self, ext2: &mut Ext2Volume) -> Result<(), VfsError> {
         let addr = match self.location.location {
             InodeReadingLocationInfo::Direct(_) => 0,
             InodeReadingLocationInfo::Single(_) => self.inode.single_indirect_block_pointer,
             InodeReadingLocationInfo::Double(_, _) => self.inode.double_indirect_block_pointer,
             InodeReadingLocationInfo::Triple(_, _, _) => self.inode.triple_indirect_block_pointer,
         };
+
+        Self::save_if_addresses_differ(
+            ext2,
+            &self.table1,
+            self.table1_addr,
+            addr,
+            self.table1_dirty,
+        )?;
+        self.table1_dirty = false;
+
         if addr == 0 {
             self.table1_addr = 0;
             return Ok(());
@@ -355,13 +432,23 @@ impl CachedInodeReadingLocation {
         }
     }
 
-    fn check_table2(&mut self, ext2: &Ext2Volume) -> Result<(), VfsError> {
+    fn check_table2(&mut self, ext2: &mut Ext2Volume) -> Result<(), VfsError> {
         let addr = match self.location.location {
             InodeReadingLocationInfo::Direct(_) => 0,
             InodeReadingLocationInfo::Single(_) => 0,
             InodeReadingLocationInfo::Double(p1, _)
             | InodeReadingLocationInfo::Triple(p1, _, _) => self.follow1(p1)?,
         };
+
+        Self::save_if_addresses_differ(
+            ext2,
+            &self.table2,
+            self.table2_addr,
+            addr,
+            self.table2_dirty,
+        )?;
+        self.table2_dirty = false;
+
         if addr == 0 {
             self.table2_addr = 0;
             return Ok(());
@@ -390,13 +477,23 @@ impl CachedInodeReadingLocation {
         }
     }
 
-    fn check_table3(&mut self, ext2: &Ext2Volume) -> Result<(), VfsError> {
+    fn check_table3(&mut self, ext2: &mut Ext2Volume) -> Result<(), VfsError> {
         let addr = match self.location.location {
             InodeReadingLocationInfo::Direct(_) => 0,
             InodeReadingLocationInfo::Single(_) => 0,
             InodeReadingLocationInfo::Double(_, p2)
             | InodeReadingLocationInfo::Triple(_, p2, _) => self.follow2(p2)?,
         };
+
+        Self::save_if_addresses_differ(
+            ext2,
+            &self.table3,
+            self.table3_addr,
+            addr,
+            self.table3_dirty,
+        )?;
+        self.table3_dirty = false;
+
         if addr == 0 {
             self.table3_addr = 0;
             return Ok(());
@@ -425,7 +522,7 @@ impl CachedInodeReadingLocation {
         }
     }
 
-    pub fn seek(&mut self, ext2: &Ext2Volume, block: u32) -> Result<(), VfsError> {
+    pub fn seek(&mut self, ext2: &mut Ext2Volume, block: u32) -> Result<(), VfsError> {
         self.location = InodeReadingLocation::new(ext2.get_block_size() as u32 / 4, block);
         self.check_table1(ext2)?;
         self.check_table2(ext2)?;
@@ -463,7 +560,23 @@ impl CachedInodeReadingLocation {
         }
     }
 
-    pub fn advance(&mut self, ext2: &Ext2Volume) -> Result<bool, VfsError> {
+    pub fn write_block(&mut self, ext2: &mut Ext2Volume, buffer: &[u8]) -> Result<u64, VfsError> {
+        let bs = ext2.get_block_size();
+        if buffer.len() < bs as usize {
+            return Err(VfsError::BadBufferSize);
+        }
+        let block = self.get_next_block()?;
+        let block_idx = self.location.current_block_idx();
+        ext2.write_block(block as u64, buffer)?;
+        if block_idx < self.max_block {
+            Ok(bs)
+        } else {
+            let write = (self.inode.size_lo as u64) % bs;
+            Ok(if write == 0 { bs } else { write })
+        }
+    }
+
+    pub fn advance(&mut self, ext2: &mut Ext2Volume) -> Result<bool, VfsError> {
         let block = self.location.current_block_idx();
         if block >= self.max_block || !self.location.advance() {
             return Ok(false);
@@ -484,5 +597,114 @@ impl CachedInodeReadingLocation {
 
     pub fn get_inode(&self) -> &Inode {
         &self.inode
+    }
+
+    pub fn get_inode_mut(&mut self) -> &mut Inode {
+        &mut self.inode
+    }
+
+    pub fn update(&mut self, volume: &Ext2Volume) -> Result<(), VfsError> {
+        let max_block: u32 = (self.inode.get_size(volume) / self.block_size)
+            .try_into()
+            .map_err(|e| VfsError::DriverError(Box::new(e)))?;
+        self.max_block = max_block;
+        Ok(())
+    }
+
+    pub fn block_count(&self) -> u32 {
+        self.max_block + 1
+    }
+
+    pub fn free_last_block(&mut self, ext2: &mut Ext2Volume) -> Result<(), VfsError> {
+        self.seek(ext2, self.max_block)?;
+
+        let block = self.get_next_block()?;
+        let group = block / ext2.blocks_per_group;
+
+        let balloc = ext2
+            .get_block_allocator_for_group(group)?
+            .ok_or(VfsError::DriverError(Box::new(format!(
+                "No block allocator for group {group}"
+            ))))?;
+        balloc.dealloc_block(block)?;
+        unsafe {
+            match self.location.location {
+                InodeReadingLocationInfo::Direct(direct) => {
+                    self.inode.direct_block_pointers[direct as usize] = 0;
+                    self.inode_dirty = true;
+                }
+                InodeReadingLocationInfo::Single(idx0) => {
+                    *(self.table1.as_mut_ptr() as *mut u32).add(idx0 as usize) = 0;
+                    self.table1_dirty = true;
+                    if idx0 == 0 {
+                        self.inode.single_indirect_block_pointer = 0;
+                        self.inode_dirty = true;
+                        balloc.dealloc_block(self.table1_addr)?;
+                    }
+                }
+                InodeReadingLocationInfo::Double(idx0, idx1) => {
+                    *(self.table2.as_mut_ptr() as *mut u32).add(idx1 as usize) = 0;
+                    self.table2_dirty = true;
+                    if idx1 == 0 {
+                        balloc.dealloc_block(
+                            *(self.table1.as_mut_ptr() as *mut u32).add(idx0 as usize),
+                        )?;
+                        *(self.table1.as_mut_ptr() as *mut u32).add(idx0 as usize) = 0;
+                        self.table1_dirty = true;
+                        if idx0 == 0 {
+                            self.inode.double_indirect_block_pointer = 0;
+                            self.inode_dirty = true;
+                            balloc.dealloc_block(self.table1_addr)?;
+                        }
+                    }
+                }
+                InodeReadingLocationInfo::Triple(idx0, idx1, idx2) => {
+                    *(self.table3.as_mut_ptr() as *mut u32).add(idx2 as usize) = 0;
+                    self.table3_dirty = true;
+                    if idx2 == 0 {
+                        balloc.dealloc_block(
+                            *(self.table2.as_mut_ptr() as *mut u32).add(idx1 as usize),
+                        )?;
+                        *(self.table2.as_mut_ptr() as *mut u32).add(idx1 as usize) = 0;
+                        self.table2_dirty = true;
+                        if idx1 == 0 {
+                            balloc.dealloc_block(
+                                *(self.table1.as_mut_ptr() as *mut u32).add(idx0 as usize),
+                            )?;
+                            *(self.table1.as_mut_ptr() as *mut u32).add(idx0 as usize) = 0;
+                            self.table1_dirty = true;
+                            if idx0 == 0 {
+                                self.inode.triple_indirect_block_pointer = 0;
+                                self.inode_dirty = true;
+                                balloc.dealloc_block(self.table1_addr)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.max_block -= 1;
+        Ok(())
+    }
+
+    pub fn flush(&mut self, ext2: &mut Ext2Volume) -> Result<(), VfsError> {
+        if self.table1_dirty && self.table1_addr != 0 {
+            ext2.write_block(self.table1_addr as u64, &self.table1)?;
+            self.table1_dirty = false;
+        }
+        if self.table2_dirty && self.table2_addr != 0 {
+            ext2.write_block(self.table2_addr as u64, &self.table2)?;
+            self.table2_dirty = false;
+        }
+        if self.table3_dirty && self.table3_addr != 0 {
+            ext2.write_block(self.table3_addr as u64, &self.table3)?;
+            self.table3_dirty = false;
+        }
+        if self.inode_dirty {
+            ext2.update_inode(&self.inode)?;
+            self.inode_dirty = false;
+        }
+        Ok(())
     }
 }

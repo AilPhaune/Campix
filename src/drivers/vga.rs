@@ -492,6 +492,13 @@ impl DevFsDriver for VgaDriver {
         Ok(bytes_written)
     }
 
+    fn ftruncate(&mut self, _dev_fs: &mut DevFs, handle: u64) -> Result<u64, VfsError> {
+        if !self.handles.contains(&handle) {
+            return Err(VfsError::BadHandle);
+        }
+        Err(VfsError::ActionNotAllowed)
+    }
+
     fn fflush(&mut self, dev_fs: &mut DevFs, handle: u64) -> Result<(), VfsError> {
         if !self.handles.contains(&handle) {
             return Err(VfsError::BadHandle);
@@ -512,6 +519,12 @@ impl DevFsDriver for VgaDriver {
             return Err(VfsError::BadHandle);
         }
         Ok(())
+    }
+}
+
+impl Drop for VgaDriver {
+    fn drop(&mut self) {
+        self.handles.clear();
     }
 }
 

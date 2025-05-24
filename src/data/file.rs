@@ -28,7 +28,7 @@ impl File {
     pub fn open(path: &str, mode: u64) -> Result<File, VfsError> {
         let path = path.chars().collect::<Vec<char>>();
         let fs = get_vfs();
-        let guard = fs.read();
+        let mut guard = fs.write();
         let file = guard.get_file(&path)?;
         let fs = guard
             .get_fs_by_id(file.fs())
@@ -90,28 +90,42 @@ impl File {
         self.handle
     }
 
+    /// Writes the buffer to the file at the current position, incrementing the position by the amount of bytes written, and returns the number of bytes written
     pub fn write(&mut self, buf: &[u8]) -> Result<u64, VfsError> {
         let mut guard = self.fs.write();
         guard.fwrite(self.handle, buf)
     }
 
+    /// Reads contents from the file at the current position, incrementing the position by the amount of bytes read, and returns the number of bytes read, reading at most enough bytes to fill the buffer
     pub fn read(&self, buf: &mut [u8]) -> Result<u64, VfsError> {
         let mut guard = self.fs.write();
         guard.fread(self.handle, buf)
     }
 
+    /// Seeks to a specific position in the file, returning the new position or an error if the position is invalid
     pub fn seek(&self, position: SeekPosition) -> Result<u64, VfsError> {
         let mut guard = self.fs.write();
         guard.fseek(self.handle, position)
     }
 
-    fn _close(&mut self) -> Result<(), VfsError> {
+    /// Truncates the file to the current position, and returns the new position
+    pub fn truncate(&mut self) -> Result<u64, VfsError> {
         let mut guard = self.fs.write();
-        guard.fclose(self.handle)
+        guard.ftruncate(self.handle)
+    }
+
+    /// Closes the file
+    /// # Safety
+    /// Safe but all subsequent calls to functions on this File will return errors
+    pub unsafe fn _close(&mut self) -> Result<(), VfsError> {
+        let mut guard = self.fs.write();
+        guard.fclose(self.handle)?;
+        self.handle = 0;
+        Ok(())
     }
 
     pub fn close(mut self) -> Result<(), VfsError> {
-        self._close()
+        unsafe { self._close() }
     }
 
     pub fn sync(&mut self) -> Result<(), VfsError> {
@@ -127,13 +141,13 @@ impl File {
     pub fn list_directory(path: &str) -> Result<Vec<DirectoryEntry>, VfsError> {
         let path = path.chars().collect::<Vec<char>>();
         let fs = get_vfs();
-        let guard: &dyn FileSystem = &**fs.read();
+        let guard: &mut dyn FileSystem = &mut **fs.write();
         let directory = guard.get_file(&path)?;
         if directory.is_mount_point() {
             let fs = directory
                 .get_mounted_fs()
                 .ok_or(VfsError::FileSystemNotMounted)?;
-            let guard = &**fs.read();
+            let guard = &mut **fs.write();
             let directory = guard.get_root()?;
             return Ok(guard
                 .list_children(&directory)?
@@ -160,7 +174,7 @@ impl File {
 
 impl Drop for File {
     fn drop(&mut self) {
-        let _ = self._close();
+        let _ = unsafe { self._close() };
     }
 }
 
@@ -235,13 +249,13 @@ impl DirectoryEntry {
             }
         }
         let fs = get_vfs();
-        let guard: &dyn FileSystem = &**fs.read();
+        let guard: &mut dyn FileSystem = &mut **fs.write();
         let directory = guard.get_file(&path)?;
         if directory.is_mount_point() {
             let fs = directory
                 .get_mounted_fs()
                 .ok_or(VfsError::FileSystemNotMounted)?;
-            let guard = &**fs.read();
+            let guard = &mut **fs.write();
             let directory = guard.get_root()?;
             Ok(DirectoryEntry {
                 full_name: path,
