@@ -230,7 +230,11 @@ impl FileSystem for DevFs {
         _name: &[char],
         _kind: VfsFileKind,
     ) -> Result<VfsFile, VfsError> {
-        Err(VfsError::ActionNotAllowed)
+        Err(VfsError::ReadOnly)
+    }
+
+    fn delete_file(&mut self, _file: &VfsFile) -> Result<(), VfsError> {
+        Err(VfsError::ReadOnly)
     }
 
     fn get_child(&mut self, file: &VfsFile, child: &[char]) -> Result<VfsFile, VfsError> {

@@ -4,7 +4,7 @@ use crate::{
     data::alloc_boxed_slice,
     drivers::{
         fs::virt::devfs::fseek_helper,
-        vfs::{BlockDevice, SeekPosition, VfsError},
+        vfs::{BlockDevice, SeekPosition, VfsError, OPEN_MODE_BINARY, OPEN_MODE_WRITE},
     },
 };
 
@@ -304,63 +304,166 @@ impl DirectoryEntry {
 
 pub struct DirectoryIterator<'a> {
     volume: &'a mut Ext2Volume,
-    reader: FileHandle,
+    handle: FileHandle,
     size: usize,
 
     buffer: Box<[u8]>,
     buffer_idx: usize,
     idx: usize,
+
+    have_type_field: bool,
+    last_entry_offset: Option<u64>,
 }
 
 impl<'a> DirectoryIterator<'a> {
     pub fn new(volume: &'a mut Ext2Volume, inode: Inode, open_mode: u64) -> Result<Self, VfsError> {
+        let have_type_field = volume
+            .get_superblock()
+            .get_required_features()
+            .has(RequiredFeature::DirectoryEntriesHaveTypeField);
         let size = inode.get_size(volume) as usize;
         let buffer = alloc_boxed_slice::<u8>(volume.block_size as usize);
-        let reader = FileHandle::new(volume, inode, open_mode)?;
+        let handle = FileHandle::new(volume, inode, open_mode)?;
         Ok(Self {
             volume,
-            reader,
+            handle,
             size,
             buffer,
             buffer_idx: usize::MAX,
             idx: 0,
+            have_type_field,
+            last_entry_offset: None,
         })
     }
 
     pub fn consume(self) -> Inode {
-        self.reader.consume()
+        self.handle.consume()
     }
 
     pub fn get_index(&self) -> usize {
         self.idx
     }
+
+    fn read_buffer(&mut self) -> Result<usize, VfsError> {
+        let buffer_idx = self.idx / self.volume.block_size as usize;
+        let idx = self.idx % self.volume.block_size as usize;
+        if buffer_idx != self.buffer_idx {
+            self.handle.read(self.volume, &mut self.buffer)?;
+            self.buffer_idx = buffer_idx;
+        }
+        Ok(idx)
+    }
+
+    pub fn delete_entry(&mut self, entry: DirectoryIteratorEntry) -> Result<(), VfsError> {
+        self.idx = entry.offset as usize;
+        let idx = self.read_buffer()?;
+
+        let mut entry_raw = unsafe {
+            (self.buffer.as_ptr().add(self.idx) as *const DirectoryEntryRaw).read_unaligned()
+        };
+
+        let name_len = if self.have_type_field {
+            entry_raw.len_lo as usize
+        } else {
+            ((entry_raw.type_or_len_hi as usize) << 8) + (entry_raw.len_lo as usize)
+        };
+
+        let name_offset = idx + size_of::<DirectoryEntryRaw>();
+
+        self.buffer[name_offset..(name_offset + name_len)].fill(0);
+
+        entry_raw.inode = 0;
+        entry_raw.type_or_len_hi = 0;
+        entry_raw.len_lo = 0;
+        entry_raw.entry_size = if let Some(previous) = entry.prev_entry_offset {
+            let previous_block = previous / self.volume.block_size as u64;
+            if previous_block == self.buffer_idx as u64 {
+                // We will coalesce
+                0
+            } else {
+                // Don't touch
+                entry_raw.entry_size
+            }
+        } else {
+            // Don't touch
+            entry_raw.entry_size
+        };
+
+        unsafe {
+            (self.buffer.as_ptr().add(self.idx) as *mut DirectoryEntryRaw)
+                .write_unaligned(entry_raw)
+        };
+
+        macro_rules! done {
+            () => {
+                let pos = self.buffer_idx as u64 * self.volume.block_size as u64;
+                self.handle
+                    .seek(self.volume, SeekPosition::FromStart(pos))?;
+                self.handle.write(self.volume, &self.buffer)?;
+                self.handle.flush(self.volume)?;
+
+                self.idx = (entry.offset + entry.rec_len) as usize;
+                self.read_buffer()?;
+            };
+        }
+
+        let Some(previous) = entry.prev_entry_offset else {
+            done!();
+            return Ok(());
+        };
+
+        let previous_block = previous / self.volume.block_size as u64;
+        if previous_block != self.buffer_idx as u64 {
+            done!();
+            return Ok(());
+        }
+
+        // coalesce
+        self.idx = previous as usize;
+        let idx = self.idx % self.volume.block_size as usize;
+
+        let mut prev_entry_raw =
+            unsafe { (self.buffer.as_ptr().add(idx) as *const DirectoryEntryRaw).read_unaligned() };
+
+        if let Ok(rec_len) =
+            u16::try_from(prev_entry_raw.entry_size as usize + entry.rec_len as usize)
+        {
+            prev_entry_raw.entry_size = rec_len;
+        }
+
+        unsafe {
+            (self.buffer.as_ptr().add(idx) as *mut DirectoryEntryRaw)
+                .write_unaligned(prev_entry_raw)
+        };
+
+        done!();
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct DirectoryIteratorEntry {
+    entry: DirectoryEntry,
+    prev_entry_offset: Option<u64>,
+    offset: u64,
+    rec_len: u64,
 }
 
 impl<'a> Iterator for DirectoryIterator<'a> {
-    type Item = DirectoryEntry;
+    type Item = DirectoryIteratorEntry;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if self.idx >= self.size {
                 return None;
             }
-            let buffer_idx = self.idx / self.volume.block_size as usize;
-            let idx = self.idx % self.volume.block_size as usize;
-            if buffer_idx != self.buffer_idx {
-                self.reader.read(self.volume, &mut self.buffer).ok()?;
-                self.buffer_idx = buffer_idx;
-            }
+            let idx = self.read_buffer().ok()?;
 
             let entry_raw = unsafe {
                 (self.buffer.as_ptr().add(self.idx) as *const DirectoryEntryRaw).read_unaligned()
             };
 
-            let name_len = if self
-                .volume
-                .get_superblock()
-                .get_required_features()
-                .has(RequiredFeature::DirectoryEntriesHaveTypeField)
-            {
+            let name_len = if self.have_type_field {
                 entry_raw.len_lo as usize
             } else {
                 ((entry_raw.type_or_len_hi as usize) << 8) + (entry_raw.len_lo as usize)
@@ -369,11 +472,20 @@ impl<'a> Iterator for DirectoryIterator<'a> {
             let name_offset = idx + size_of::<DirectoryEntryRaw>();
             let name = &self.buffer[name_offset..(name_offset + name_len)];
 
-            self.idx += entry_raw.entry_size as usize;
+            let begin_offset = self.idx as u64;
+            let rec_len = entry_raw.entry_size as u64;
+            self.idx += rec_len as usize;
             if entry_raw.inode != 0 {
-                return Some(DirectoryEntry {
-                    iode: entry_raw.inode,
-                    name: name.iter().map(|c| *c as char).collect(),
+                let last_offset = self.last_entry_offset;
+                self.last_entry_offset = Some(begin_offset);
+                return Some(DirectoryIteratorEntry {
+                    entry: DirectoryEntry {
+                        iode: entry_raw.inode,
+                        name: name.iter().map(|c| *c as char).collect(),
+                    },
+                    offset: begin_offset,
+                    prev_entry_offset: last_offset,
+                    rec_len,
                 });
             }
             if entry_raw.entry_size == 0 {
@@ -393,8 +505,26 @@ impl Directory {
     pub fn new(volume: &mut Ext2Volume, inode: Inode, open_mode: u64) -> Result<Self, VfsError> {
         let iterator = DirectoryIterator::new(volume, inode.clone(), open_mode)?;
         Ok(Self {
-            entries: iterator.collect(),
+            entries: iterator.map(|v| v.entry).collect(),
             inode,
         })
+    }
+
+    pub fn delete_entry(
+        volume: &mut Ext2Volume,
+        inode: &Inode,
+        entry_inode: u32,
+    ) -> Result<(), VfsError> {
+        let mut iterator =
+            DirectoryIterator::new(volume, inode.clone(), OPEN_MODE_BINARY | OPEN_MODE_WRITE)?;
+
+        while let Some(next) = iterator.next() {
+            if next.entry.iode == entry_inode {
+                iterator.delete_entry(next)?;
+                return Ok(());
+            }
+        }
+
+        Err(VfsError::EntryNotFound)
     }
 }

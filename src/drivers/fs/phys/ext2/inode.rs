@@ -33,6 +33,34 @@ pub struct RawInode {
     pub ossv2: [u8; 12],
 }
 
+impl RawInode {
+    pub fn empty() -> Self {
+        Self {
+            type_and_permissions: 0,
+            uid: 0,
+            size_lo: 0,
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+            dtime: 0,
+            gid: 0,
+            links_count: 0,
+            sectors_count: 0,
+            flags: 0,
+            ossv1: 0,
+            direct_block_pointers: [0; 12],
+            single_indirect_block_pointer: 0,
+            double_indirect_block_pointer: 0,
+            triple_indirect_block_pointer: 0,
+            generation_number: 0,
+            extended_attribute_block: 0,
+            size_hi_or_dir_acl: 0,
+            fragment_block: 0,
+            ossv2: [0; 12],
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Inode {
     pub inode_type: InodeType,
@@ -60,10 +88,12 @@ pub struct Inode {
 
     // The inode number
     pub inode_i: u32,
+    // The parent inode
+    pub parent_inode: Option<u32>,
 }
 
 impl Inode {
-    pub const fn from_raw(raw_inode: RawInode, inode_i: u32) -> Self {
+    pub const fn from_raw(raw_inode: RawInode, inode_i: u32, parent_inode: Option<u32>) -> Self {
         Self {
             inode_type: unsafe {
                 core::mem::transmute::<u16, InodeType>(raw_inode.type_and_permissions & 0xF000)
@@ -95,6 +125,7 @@ impl Inode {
             ossv2: raw_inode.ossv2,
 
             inode_i,
+            parent_inode,
         }
     }
 

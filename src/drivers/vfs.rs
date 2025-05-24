@@ -38,6 +38,7 @@ pub enum VfsError {
     FileSystemMismatch,
     ActionNotAllowed,
     PathNotFound,
+    ReadOnly,
     FileSystemNotMounted,
     BadBufferSize,
     NotDirectory,
@@ -52,6 +53,7 @@ pub enum VfsError {
     OutOfSpace,
     InvalidArgument,
     MaximumSizeReached,
+    EntryNotFound,
     DriverError(Box<dyn core::fmt::Debug>),
 }
 
@@ -406,6 +408,9 @@ pub trait FileSystem: Send + Sync + core::fmt::Debug + AsAny {
         name: &[char],
         kind: VfsFileKind,
     ) -> Result<VfsFile, VfsError>;
+
+    /// Deletes a file, or an empty directory
+    fn delete_file(&mut self, file: &VfsFile) -> Result<(), VfsError>;
 
     /// Called when filesystem is mounted
     /// Returns the root directory of the mounted filesystem
@@ -985,6 +990,10 @@ impl FileSystem for Vfs {
         if !directory.is_directory() {
             return Err(VfsError::NotDirectory);
         }
+        Err(VfsError::ActionNotAllowed)
+    }
+
+    fn delete_file(&mut self, _file: &VfsFile) -> Result<(), VfsError> {
         Err(VfsError::ActionNotAllowed)
     }
 

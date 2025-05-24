@@ -2,6 +2,7 @@ use core::num::NonZeroUsize;
 
 use alloc::{
     boxed::Box,
+    format,
     string::{String, ToString},
     sync::Arc,
     vec::Vec,
@@ -9,6 +10,7 @@ use alloc::{
 use balloc::BlockAllocator;
 use blockgroup::{BlockGroupDescriptor, RawBlockGroupDescriptor, BLOCK_GROUP_DESCRIPTOR_SIZE};
 use file::{Directory, FileHandle};
+use ialloc::InodeAllocator;
 use inode::{Inode, InodeReadingLocation, InodeType, RawInode};
 use lru::LruCache;
 use spin::RwLock;
@@ -19,17 +21,21 @@ use superblock::{
 
 use crate::{
     data::{alloc_boxed_slice, either::Either, file::File},
-    drivers::vfs::{
-        default_get_file_implementation, Arcrwb, BlockDevice, FileHandleAllocator, FileStat,
-        FileSystem, FsSpecificFileData, SeekPosition, Vfs, VfsError, VfsFile, VfsFileKind,
-        WeakArcrwb, OPEN_MODE_APPEND, OPEN_MODE_BINARY, OPEN_MODE_NO_RESIZE, OPEN_MODE_READ,
-        OPEN_MODE_WRITE,
+    drivers::{
+        time::get_unix_timestamp,
+        vfs::{
+            default_get_file_implementation, Arcrwb, BlockDevice, FileHandleAllocator, FileStat,
+            FileSystem, FsSpecificFileData, SeekPosition, Vfs, VfsError, VfsFile, VfsFileKind,
+            WeakArcrwb, OPEN_MODE_APPEND, OPEN_MODE_BINARY, OPEN_MODE_NO_RESIZE, OPEN_MODE_READ,
+            OPEN_MODE_WRITE,
+        },
     },
 };
 
 pub mod balloc;
 pub mod blockgroup;
 pub mod file;
+pub mod ialloc;
 pub mod inode;
 pub mod superblock;
 
@@ -80,6 +86,7 @@ pub struct Ext2Volume {
 
     block_cache: RwLock<LruCache<u32, Box<[u8]>>>,
     group_block_bitmap_caches: LruCache<u32, BlockAllocator>,
+    group_inode_bitmap_caches: LruCache<u32, InodeAllocator>,
 
     // VFS stuff
     root_dir_fs_data: Option<Arc<Ext2FsSpecificFileData>>,
@@ -117,6 +124,7 @@ impl Ext2Volume {
         device: File,
         block_cache_size: NonZeroUsize,
         block_usage_bitmap_cache_size: NonZeroUsize,
+        inode_usage_bitmap_cache_size: NonZeroUsize,
     ) -> Result<Self, VfsError> {
         if (device.get_open_mode() & OPEN_MODE_BINARY) == 0
             || (device.get_open_mode() & OPEN_MODE_READ) == 0
@@ -202,6 +210,13 @@ impl Ext2Volume {
             .unwrap(), // Guaranteed to be non-zero
         );
 
+        let inode_bitmaps_lru = LruCache::new(
+            NonZeroUsize::new(inode_usage_bitmap_cache_size.get().div_ceil(
+                BlockAllocator::group_bitmap_size(blocks_per_group, block_size),
+            ))
+            .unwrap(), // Guaranteed to be non-zero
+        );
+
         let mut ext2 = Self {
             device,
             read_only,
@@ -216,6 +231,7 @@ impl Ext2Volume {
             inodes_per_block,
             block_cache: RwLock::new(block_lru),
             group_block_bitmap_caches: block_bitmaps_lru,
+            group_inode_bitmap_caches: inode_bitmaps_lru,
             // VFS stuff
             root_dir_fs_data: None,
             os_id: 0,
@@ -289,7 +305,14 @@ impl Ext2Volume {
         (inode - 1) % self.superblock.inodes_per_group
     }
 
-    pub fn get_inode(&self, inode: u32) -> Result<Inode, VfsError> {
+    /// Returns the min (inclusive) and max (exclusive) inodes in the given group
+    fn get_inode_range_for_group(&self, group: u32) -> (u32, u32) {
+        let start = group * self.superblock.inodes_per_group;
+        let end = (group + 1) * self.superblock.inodes_per_group;
+        (start + 1, (end + 1).min(self.superblock.inodes_count))
+    }
+
+    pub fn get_inode(&self, inode: u32, parent_inode: Option<u32>) -> Result<Inode, VfsError> {
         if inode == 0 || inode > self.superblock.inodes_count {
             Err(Ext2Error::BadInodeIndex(inode))?;
         }
@@ -309,17 +332,20 @@ impl Ext2Volume {
         let mut buffer = alloc::vec![0u8; self.block_size as usize];
         self.read_block((block + block_index) as u64, &mut buffer)?;
 
-        Ok(Inode::from_raw(
-            unsafe {
-                (buffer.as_ptr().add(offset_in_block as usize) as *const RawInode).read_unaligned()
-            },
-            inode,
-        ))
+        let raw = unsafe {
+            (buffer.as_ptr().add(offset_in_block as usize) as *const RawInode).read_unaligned()
+        };
+
+        Ok(Inode::from_raw(raw, inode, parent_inode))
     }
 
     pub fn update_inode(&mut self, inode: &Inode) -> Result<(), VfsError> {
-        let group = self.get_inode_group(inode.inode_i);
-        let index = self.get_inode_index_in_group(inode.inode_i);
+        self.update_inode_raw(inode.inode_i, inode.get_raw())
+    }
+
+    pub fn update_inode_raw(&mut self, inode_i: u32, raw_inode: RawInode) -> Result<(), VfsError> {
+        let group = self.get_inode_group(inode_i);
+        let index = self.get_inode_index_in_group(inode_i);
 
         let block = self
             .block_group_descriptor_table
@@ -334,7 +360,7 @@ impl Ext2Volume {
         self.read_block((block + block_index) as u64, &mut buffer)?;
         unsafe {
             (buffer.as_ptr().add(offset_in_block as usize) as *mut RawInode)
-                .write_unaligned(inode.get_raw())
+                .write_unaligned(raw_inode)
         };
         self.write_block((block + block_index) as u64, &buffer)?;
 
@@ -345,8 +371,13 @@ impl Ext2Volume {
         FileHandle::new(self, inode, mode)
     }
 
-    fn get_file_for_inode(&mut self, inode_i: u32, name: Vec<char>) -> Result<VfsFile, VfsError> {
-        let inode = self.get_inode(inode_i)?;
+    fn get_file_for_inode(
+        &mut self,
+        inode_i: u32,
+        parent_inode: Option<u32>,
+        name: Vec<char>,
+    ) -> Result<VfsFile, VfsError> {
+        let inode = self.get_inode(inode_i, parent_inode)?;
 
         let size = inode.get_size(self);
         let (data, kind) = match inode.inode_type {
@@ -374,6 +405,82 @@ impl Ext2Volume {
             self.os_id,
             Arc::new(Ext2FsSpecificFileData { value: data }),
         ))
+    }
+
+    fn dealloc_inode(&mut self, inode: Inode) -> Result<(), VfsError> {
+        let inode_i = inode.inode_i;
+        let mut handle =
+            self.get_file_handle(inode, OPEN_MODE_BINARY | OPEN_MODE_READ | OPEN_MODE_WRITE)?;
+        // deallocate all the blocks
+        handle.truncate(self, 0)?;
+        handle.flush(self)?;
+        drop(handle);
+
+        let allocator = self
+            .get_inode_allocator_for_group(self.get_inode_group(inode_i))?
+            .ok_or(VfsError::DriverError(Box::new(format!(
+                "No inode allocator for inode {inode_i}"
+            ))))?;
+        allocator.dealloc_inode(inode_i)?;
+
+        Ok(())
+    }
+
+    fn delete_inode(&mut self, inode: &Inode) -> Result<(), VfsError> {
+        if !matches!(inode.inode_type, InodeType::File | InodeType::Directory) {
+            // TODO: Not implemented
+            return Err(VfsError::ActionNotAllowed);
+        }
+        let parent = inode
+            .parent_inode
+            .ok_or(VfsError::DriverError(Box::new(format!(
+                "delete_inode: Inode {} has no parent",
+                inode.inode_i
+            ))))?;
+
+        let dir_inode = self.get_inode(parent, None)?;
+        Directory::delete_entry(self, &dir_inode, inode.inode_i)?;
+
+        let mut new_inode = inode.clone();
+        let mut t = get_unix_timestamp() as u32;
+        if t == 0 {
+            t = 1;
+        }
+        new_inode.dtime = t;
+
+        match inode.inode_type {
+            InodeType::File => {
+                new_inode.links_count -= 1;
+            }
+            InodeType::Directory => {
+                let igroup = self.get_inode_group(inode.inode_i);
+                let mut group_descriptor = self
+                    .get_block_group_descriptor(igroup)
+                    .ok_or(Ext2Error::BadBlockGroupDescriptorTable)?;
+                group_descriptor.directory_count -= 1;
+                self.set_block_group_descriptor(igroup, group_descriptor)?;
+
+                // Deleted from parent + deleted self reference
+                new_inode.links_count -= 2;
+                // Deleted reference to parent directory
+                if parent == new_inode.inode_i {
+                    new_inode.links_count -= 1;
+                } else {
+                    let mut parent_inode = self.get_inode(parent, None)?;
+                    parent_inode.links_count -= 1;
+                    self.update_inode(&parent_inode)?;
+                }
+            }
+            _ => unreachable!(),
+        }
+
+        if new_inode.links_count == 0 {
+            self.dealloc_inode(new_inode)?;
+        } else {
+            self.update_inode(&new_inode)?;
+        }
+
+        Ok(())
     }
 
     pub fn get_block_group_descriptor(&self, group: u32) -> Option<BlockGroupDescriptor> {
@@ -408,9 +515,12 @@ impl Ext2Volume {
             .has(ROFeature::SparseDescriptorTables)
         {
             if self.block_group_count <= 1 {
-                return Box::new(0..=self.block_group_count);
+                return Box::new(0..self.block_group_count);
             }
-            let mut vec: Vec<u32> = alloc::vec![0, 1];
+            let mut vec: Vec<u32> = alloc::vec![0];
+            if self.block_group_count > 1 {
+                vec.push(1);
+            }
             let mut pow3: u32 = 1;
             let mut pow5: u32 = 1;
             let mut pow7: u32 = 1;
@@ -544,7 +654,6 @@ impl Ext2Volume {
             bitmap_begin_inclusive,
             bitmap_end_exclusive,
             self.block_size,
-            descriptor,
         );
         allocator.read_all(self)?;
 
@@ -556,14 +665,8 @@ impl Ext2Volume {
     }
 
     pub fn flush_block_bitmap_cache(&mut self, group: u32) -> Result<(), VfsError> {
-        if let Some(mut allocator) = self.group_block_bitmap_caches.pop(&group) {
-            let diff = *allocator.get_diff_usage();
-            *allocator.get_diff_usage() = 0;
-
-            let mut superblock = self.get_superblock().clone();
-            superblock.unallocated_blocks = ((superblock.unallocated_blocks as i64) - diff) as u32;
+        if let Some(allocator) = self.group_block_bitmap_caches.pop(&group) {
             self.handle_evicted_block_bitmap_cache(group, allocator)?;
-            self.set_superblock(superblock)?;
         }
         Ok(())
     }
@@ -574,7 +677,18 @@ impl Ext2Volume {
         mut allocator: BlockAllocator,
     ) -> Result<(), VfsError> {
         allocator.write_dirty(self)?;
-        self.set_block_group_descriptor(group, allocator.consume())?;
+
+        let diff = *allocator.get_diff_usage();
+        *allocator.get_diff_usage() = 0;
+
+        let mut superblock = self.get_superblock().clone();
+        superblock.unallocated_blocks = ((superblock.unallocated_blocks as i64) - diff) as u32;
+        self.set_superblock(superblock)?;
+
+        let mut descriptor = self.get_block_group_descriptor(group).unwrap();
+        descriptor.free_blocks_count = ((descriptor.free_blocks_count as i64) - diff) as u16;
+        self.set_block_group_descriptor(group, descriptor)?;
+
         Ok(())
     }
 
@@ -582,6 +696,88 @@ impl Ext2Volume {
         for group in 1..self.block_group_count {
             if let Some(allocator) = self.get_block_allocator_for_group(group)? {
                 if let Ok(block) = allocator.alloc_block() {
+                    return Ok(block);
+                }
+            }
+        }
+        Err(VfsError::OutOfSpace)
+    }
+
+    pub fn get_inode_allocator_for_group<'a: 'b, 'b>(
+        // explicit lifetime because we make some unsafe shit to bypass ass borrow checker who can't see that `self.get_block_group_descriptor(group)` does NOT try to borrow self immutably while it's being mutably borrowed because the mutable borrow either isn't used anymore, or has been returned
+        &'a mut self,
+        group: u32,
+    ) -> Result<Option<&'b mut InodeAllocator>, VfsError> {
+        if self.read_only {
+            return Ok(None);
+        }
+
+        if let Some(cached) = self.group_inode_bitmap_caches.get_mut(&group) {
+            // Safe because we know that we're immediately returning the mutable reference, and self can't be used while it's borrowed
+            return Ok(Some(unsafe { &mut *(cached as *mut InodeAllocator) }));
+        }
+
+        let Some(descriptor) = self.get_block_group_descriptor(group) else {
+            return Ok(None);
+        };
+
+        let (min_inode_inclusive, max_inode_exclusive) = self.get_inode_range_for_group(group);
+
+        let inodes = max_inode_exclusive - min_inode_inclusive;
+
+        let bitmap_begin_inclusive = descriptor.inode_usage_bitmap;
+        let bitmap_bytes = inodes.div_ceil(8);
+        let bitmap_blocks = bitmap_bytes.div_ceil(self.block_size);
+        let bitmap_end_exclusive = bitmap_begin_inclusive + bitmap_blocks;
+
+        let mut allocator = InodeAllocator::new(
+            min_inode_inclusive,
+            max_inode_exclusive,
+            bitmap_begin_inclusive,
+            bitmap_end_exclusive,
+            self.block_size,
+        );
+        allocator.read_all(self)?;
+
+        if let Some(evicted) = self.group_inode_bitmap_caches.push(group, allocator) {
+            self.handle_evicted_inode_bitmap_cache(evicted.0, evicted.1)?;
+        }
+
+        Ok(self.group_inode_bitmap_caches.get_mut(&group))
+    }
+
+    pub fn flush_inode_bitmap_cache(&mut self, group: u32) -> Result<(), VfsError> {
+        if let Some(allocator) = self.group_inode_bitmap_caches.pop(&group) {
+            self.handle_evicted_inode_bitmap_cache(group, allocator)?;
+        }
+        Ok(())
+    }
+
+    fn handle_evicted_inode_bitmap_cache(
+        &mut self,
+        group: u32,
+        mut allocator: InodeAllocator,
+    ) -> Result<(), VfsError> {
+        allocator.write_dirty(self)?;
+
+        let diff = *allocator.get_diff_usage();
+        *allocator.get_diff_usage() = 0;
+
+        let mut superblock = self.get_superblock().clone();
+        superblock.unallocated_inodes = ((superblock.unallocated_inodes as i64) - diff) as u32;
+        self.set_superblock(superblock)?;
+
+        let mut descriptor = self.get_block_group_descriptor(group).unwrap();
+        descriptor.free_inodes_count = ((descriptor.free_inodes_count as i64) - diff) as u16;
+        self.set_block_group_descriptor(group, descriptor)?;
+
+        Ok(())
+    }
+
+    pub fn alloc_inode_any(&mut self) -> Result<u32, VfsError> {
+        for group in 1..self.block_group_count {
+            if let Some(allocator) = self.get_inode_allocator_for_group(group)? {
+                if let Ok(block) = allocator.alloc_inode() {
                     return Ok(block);
                 }
             }
@@ -598,22 +794,23 @@ impl BlockDevice for Ext2Volume {
             .map(|(k, _)| *k)
             .collect::<Vec<_>>();
 
-        let mut total_diff = 0;
-
         for group in groups {
-            if let Some(mut allocator) = self.group_block_bitmap_caches.pop(&group) {
-                let diff = *allocator.get_diff_usage();
-                *allocator.get_diff_usage() = 0;
-
-                total_diff += diff;
+            if let Some(allocator) = self.group_block_bitmap_caches.pop(&group) {
                 self.handle_evicted_block_bitmap_cache(group, allocator)?;
             }
         }
 
-        let mut superblock = self.get_superblock().clone();
-        superblock.unallocated_blocks =
-            ((superblock.unallocated_blocks as i64) - total_diff) as u32;
-        self.set_superblock(superblock)?;
+        let groups = self
+            .group_inode_bitmap_caches
+            .iter()
+            .map(|(k, _)| *k)
+            .collect::<Vec<_>>();
+
+        for group in groups {
+            if let Some(allocator) = self.group_inode_bitmap_caches.pop(&group) {
+                self.handle_evicted_inode_bitmap_cache(group, allocator)?;
+            }
+        }
 
         self.device.flush()
     }
@@ -744,7 +941,13 @@ impl FileSystem for Ext2Volume {
                 .entries
                 .iter()
                 .find(|e| e.has_name(child))
-                .map(|e| self.get_file_for_inode(e.inode(), [file.name(), e.name()].concat()))
+                .map(|e| {
+                    self.get_file_for_inode(
+                        e.inode(),
+                        Some(dir.inode.inode_i),
+                        [file.name(), e.name()].concat(),
+                    )
+                })
                 .ok_or(VfsError::PathNotFound)?,
         }
     }
@@ -767,7 +970,11 @@ impl FileSystem for Ext2Volume {
                     if e.has_name(&['.']) || e.has_name(&['.', '.']) {
                         continue;
                     }
-                    files.push(self.get_file_for_inode(e.inode(), e.name().to_vec())?);
+                    files.push(self.get_file_for_inode(
+                        e.inode(),
+                        Some(dir.inode.inode_i),
+                        e.name().to_vec(),
+                    )?);
                 }
                 Ok(files)
             }
@@ -786,6 +993,21 @@ impl FileSystem for Ext2Volume {
         Err(VfsError::ActionNotAllowed)
     }
 
+    fn delete_file(&mut self, file: &VfsFile) -> Result<(), VfsError> {
+        let data = file.get_fs_specific_data();
+        let data: &Ext2FsSpecificFileData = (*data)
+            .as_any()
+            .downcast_ref::<Ext2FsSpecificFileData>()
+            .ok_or(VfsError::FileSystemMismatch)?;
+
+        match &data.value {
+            Either::A(inode) => self.delete_inode(inode)?,
+            Either::B(directory) => self.delete_inode(&directory.inode)?,
+        }
+
+        Ok(())
+    }
+
     fn on_mount(
         &mut self,
         mount_point: &VfsFile,
@@ -799,7 +1021,7 @@ impl FileSystem for Ext2Volume {
         self.root_dir_fs_data = Some(Arc::new(Ext2FsSpecificFileData {
             value: Either::B(Directory::new(
                 self,
-                self.get_inode(2)?,
+                self.get_inode(2, None)?,
                 OPEN_MODE_BINARY | OPEN_MODE_READ,
             )?),
         }));

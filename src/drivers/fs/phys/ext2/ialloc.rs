@@ -7,9 +7,9 @@ use crate::{
 
 use super::Ext2Volume;
 
-pub struct BlockAllocator {
-    min_block_inclusive: u32,
-    max_block_exclusive: u32,
+pub struct InodeAllocator {
+    min_inode_inclusive: u32,
+    max_inode_exclusive: u32,
 
     bitmap_begin_inclusive: u32,
     bitmap_end_exclusive: u32,
@@ -22,34 +22,25 @@ pub struct BlockAllocator {
     diff_usage: i64,
 }
 
-impl BlockAllocator {
-    pub const fn group_bitmap_size(blocks_per_group: u32, block_size: u32) -> usize {
-        let block_bits = block_size as usize * 8;
-        let bitmap_bits = blocks_per_group as usize * block_bits;
-        bitmap_bits.div_ceil(8)
-    }
-
+impl InodeAllocator {
     pub fn new(
-        min_block_inclusive: u32,
-        max_block_exclusive: u32,
+        min_inode_inclusive: u32,
+        max_inode_exclusive: u32,
         bitmap_begin_inclusive: u32,
         bitmap_end_exclusive: u32,
         block_size: u32,
     ) -> Self {
+        let num_inodes = max_inode_exclusive - min_inode_inclusive;
         Self {
-            min_block_inclusive,
-            max_block_exclusive,
+            min_inode_inclusive,
+            max_inode_exclusive,
             bitmap_begin_inclusive,
             bitmap_end_exclusive,
-            bitmap: Bitmap::new(
-                (bitmap_end_exclusive - bitmap_begin_inclusive) as usize
-                    * (block_size as usize)
-                    * 8, // in bits
-            ),
-            dirty_blocks_bitmap: Bitmap::new(
-                (bitmap_end_exclusive - bitmap_begin_inclusive) as usize,
-            ),
             bs: block_size as usize,
+            // Allocate num_inodes bits for inodes, but guarantee that the underlying slice is a multiple of block_size for convenience
+            bitmap: Bitmap::new_with_size_multiple(num_inodes as usize, block_size as usize),
+            // 8*block_size is the number of bits per block
+            dirty_blocks_bitmap: Bitmap::new(num_inodes.div_ceil(8 * block_size) as usize),
             diff_usage: 0,
         }
     }
@@ -80,28 +71,27 @@ impl BlockAllocator {
         Ok(())
     }
 
-    pub fn alloc_block(&mut self) -> Result<u32, VfsError> {
+    pub fn alloc_inode(&mut self) -> Result<u32, VfsError> {
         match self.bitmap.find_first_unset() {
             Some(bit_index) => {
                 self.bitmap.set_bit(bit_index, true);
                 self.diff_usage += 1;
                 self.mark_dirty(bit_index);
-                Ok(self.min_block_inclusive + bit_index as u32)
+                Ok(self.min_inode_inclusive + bit_index as u32)
             }
             None => Err(VfsError::OutOfSpace),
         }
     }
 
-    pub fn dealloc_block(&mut self, block: u32) -> Result<(), VfsError> {
-        if block < self.min_block_inclusive || block >= self.max_block_exclusive {
+    pub fn dealloc_inode(&mut self, inode: u32) -> Result<(), VfsError> {
+        if inode < self.min_inode_inclusive || inode >= self.max_inode_exclusive {
             return Err(VfsError::InvalidArgument);
         }
 
-        let bit_index = (block - self.min_block_inclusive) as usize;
+        let bit_index = (inode - self.min_inode_inclusive) as usize;
         if !self.bitmap.get_bit(bit_index).unwrap_or(false) {
-            // double free
             return Err(VfsError::DriverError(Box::new(format!(
-                "Try to free already free block {block}"
+                "Try to free already free inode {inode}"
             ))));
         }
 
@@ -112,15 +102,15 @@ impl BlockAllocator {
     }
 
     fn mark_dirty(&mut self, bit_index: usize) {
-        let block_index = bit_index / (8 * self.bs);
+        let block_index = bit_index / (self.bs * 8);
         self.dirty_blocks_bitmap.set_bit(block_index, true);
     }
 }
 
-impl Drop for BlockAllocator {
+impl Drop for InodeAllocator {
     fn drop(&mut self) {
         if self.dirty_blocks_bitmap.find_first_set().is_some() {
-            panic!("Dropping block allocator with dirty blocks !!");
+            panic!("Dropping inode allocator with dirty blocks !!");
         }
     }
 }

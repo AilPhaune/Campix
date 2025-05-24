@@ -47,6 +47,21 @@ impl File {
         })
     }
 
+    pub fn delete(path: &str) -> Result<(), VfsError> {
+        let path = path.chars().collect::<Vec<char>>();
+        let fs = get_vfs();
+        let mut guard = fs.write();
+        let file = guard.get_file(&path)?;
+        let fs = guard
+            .get_fs_by_id(file.fs())
+            .ok_or(VfsError::FileSystemNotMounted)?;
+        drop(guard);
+        let mut guard = fs.write();
+        guard.delete_file(&file)?;
+        drop(guard);
+        Ok(())
+    }
+
     fn open_entry(entry: &DirectoryEntry, mode: u64) -> Result<File, VfsError> {
         let fs = get_vfs();
         let guard = fs.read();
