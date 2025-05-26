@@ -224,6 +224,10 @@ impl FileSystem for DevFs {
         self.os_id
     }
 
+    fn fs_flush(&mut self) -> Result<(), VfsError> {
+        Ok(())
+    }
+
     fn create_child(
         &mut self,
         _directory: &VfsFile,

@@ -383,6 +383,9 @@ pub trait FileSystem: Send + Sync + core::fmt::Debug + AsAny {
     /// Returns the file system type
     fn fs_type(&mut self) -> String;
 
+    /// Flushes, and forces the file system to write all pending writes to disk
+    fn fs_flush(&mut self) -> Result<(), VfsError>;
+
     /// Returns the block device used by the file system, None is applicable only to in-memory file systems
     fn host_block_device(&mut self) -> Option<Arcrwb<dyn BlockDevice>>;
 
@@ -840,6 +843,10 @@ impl FileSystem for Vfs {
 
     fn fs_type(&mut self) -> String {
         "vfs".to_string()
+    }
+
+    fn fs_flush(&mut self) -> Result<(), VfsError> {
+        Ok(())
     }
 
     fn host_block_device(&mut self) -> Option<Arcrwb<dyn BlockDevice>> {

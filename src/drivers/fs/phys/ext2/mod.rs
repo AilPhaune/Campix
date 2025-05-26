@@ -900,6 +900,10 @@ impl FileSystem for Ext2Volume {
         "ext2".to_string()
     }
 
+    fn fs_flush(&mut self) -> Result<(), VfsError> {
+        self.flush()
+    }
+
     fn host_block_device(&mut self) -> Option<Arcrwb<dyn BlockDevice>> {
         None
     }
