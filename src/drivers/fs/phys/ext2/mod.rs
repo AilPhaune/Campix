@@ -9,9 +9,11 @@ use alloc::{
 };
 use balloc::BlockAllocator;
 use blockgroup::{BlockGroupDescriptor, RawBlockGroupDescriptor, BLOCK_GROUP_DESCRIPTOR_SIZE};
-use file::{Directory, FileHandle};
+use file::{Directory, DirectoryEntryType, DirectoryIterator, FileHandle};
 use ialloc::InodeAllocator;
-use inode::{Inode, InodeReadingLocation, InodeType, RawInode};
+use inode::{
+    Inode, InodeFlags, InodePermission, InodePermissions, InodeReadingLocation, InodeType, RawInode,
+};
 use lru::LruCache;
 use spin::RwLock;
 use superblock::{
@@ -30,6 +32,7 @@ use crate::{
             OPEN_MODE_WRITE,
         },
     },
+    println,
 };
 
 pub mod balloc;
@@ -340,7 +343,9 @@ impl Ext2Volume {
     }
 
     pub fn update_inode(&mut self, inode: &Inode) -> Result<(), VfsError> {
-        self.update_inode_raw(inode.inode_i, inode.get_raw())
+        let mut raw = inode.get_raw();
+        raw.generation_number = raw.generation_number.wrapping_add(1);
+        self.update_inode_raw(inode.inode_i, raw)
     }
 
     pub fn update_inode_raw(&mut self, inode_i: u32, raw_inode: RawInode) -> Result<(), VfsError> {
@@ -438,6 +443,10 @@ impl Ext2Volume {
                 inode.inode_i
             ))))?;
 
+        let mut parent_inode = self.get_inode(parent, None)?;
+        parent_inode.links_count -= 1;
+        self.update_inode(&parent_inode)?;
+
         let dir_inode = self.get_inode(parent, None)?;
         Directory::delete_entry(self, &dir_inode, inode.inode_i)?;
 
@@ -480,6 +489,90 @@ impl Ext2Volume {
             self.update_inode(&new_inode)?;
         }
 
+        Ok(())
+    }
+
+    fn allocate_inode(
+        &mut self,
+        uid: u16,
+        gid: u16,
+        itype: InodeType,
+        permissions: InodePermissions,
+        flags: InodeFlags,
+        ctime: Option<u32>,
+    ) -> Result<u32, VfsError> {
+        let inode_i = self.alloc_inode_any()?;
+
+        if itype == InodeType::Directory {
+            let group = self.get_inode_group(inode_i);
+            let mut group_descriptor = self
+                .get_block_group_descriptor(group)
+                .ok_or(Ext2Error::BadBlockGroupDescriptorTable)?;
+            group_descriptor.directory_count += 1;
+            self.set_block_group_descriptor(group, group_descriptor)?;
+        }
+
+        let mut raw_inode = RawInode::empty();
+        raw_inode.uid = uid;
+        raw_inode.gid = gid;
+        raw_inode.flags = flags.get();
+        raw_inode.type_and_permissions = (itype as u16) | permissions.get();
+
+        let time = ctime.unwrap_or(get_unix_timestamp() as u32);
+        raw_inode.ctime = time;
+        raw_inode.mtime = time;
+        raw_inode.atime = time;
+
+        self.update_inode_raw(inode_i, raw_inode)?;
+        Ok(inode_i)
+    }
+
+    fn add_inode_to_directory(
+        &mut self,
+        dir_inode: u32,
+        inode_i: u32,
+        name: &[char],
+        entry_type: DirectoryEntryType,
+    ) -> Result<(), VfsError> {
+        let mut inode = self.get_inode(inode_i, None)?;
+        inode.links_count += 1;
+        self.update_inode(&inode)?;
+
+        let inode = self.get_inode(dir_inode, Some(dir_inode))?;
+        let mut iterator = DirectoryIterator::new(
+            self,
+            inode,
+            OPEN_MODE_BINARY | OPEN_MODE_READ | OPEN_MODE_WRITE,
+        )?;
+        let name = name.iter().map(|c| *c as u8).collect::<Vec<u8>>();
+
+        iterator.insert_entry(inode_i, &name, entry_type)?;
+
+        Ok(())
+    }
+
+    fn init_directory_inode(&mut self, inode_i: u32, parent_inode: u32) -> Result<(), VfsError> {
+        let mut inode = self.get_inode(inode_i, Some(parent_inode))?;
+        if inode_i == parent_inode {
+            inode.links_count += 2;
+        } else {
+            inode.links_count += 1;
+
+            let mut parent_inode = self.get_inode(parent_inode, None)?;
+            parent_inode.links_count += 1;
+            self.update_inode(&parent_inode)?;
+        }
+        self.update_inode(&inode)?;
+
+        let mut iterator = DirectoryIterator::new(
+            self,
+            inode,
+            OPEN_MODE_BINARY | OPEN_MODE_READ | OPEN_MODE_WRITE,
+        )?;
+
+        let entry_self = iterator.insert_entry(inode_i, b".", DirectoryEntryType::Directory)?;
+        iterator.move_to_entry(&entry_self)?;
+        iterator.insert_entry(parent_inode, b"..", DirectoryEntryType::Directory)?;
         Ok(())
     }
 
@@ -693,7 +786,7 @@ impl Ext2Volume {
     }
 
     pub fn alloc_block_any(&mut self) -> Result<u32, VfsError> {
-        for group in 1..self.block_group_count {
+        for group in 0..self.block_group_count {
             if let Some(allocator) = self.get_block_allocator_for_group(group)? {
                 if let Ok(block) = allocator.alloc_block() {
                     return Ok(block);
@@ -758,6 +851,7 @@ impl Ext2Volume {
         group: u32,
         mut allocator: InodeAllocator,
     ) -> Result<(), VfsError> {
+        println!("handle_evicted_inode_bitmap_cache");
         allocator.write_dirty(self)?;
 
         let diff = *allocator.get_diff_usage();
@@ -775,14 +869,27 @@ impl Ext2Volume {
     }
 
     pub fn alloc_inode_any(&mut self) -> Result<u32, VfsError> {
-        for group in 1..self.block_group_count {
+        for group in 0..self.block_group_count {
             if let Some(allocator) = self.get_inode_allocator_for_group(group)? {
-                if let Ok(block) = allocator.alloc_inode() {
-                    return Ok(block);
+                if let Ok(inode) = allocator.alloc_inode() {
+                    println!("ALLOC INODE {inode}");
+                    return Ok(inode);
                 }
             }
         }
         Err(VfsError::OutOfSpace)
+    }
+
+    #[inline(always)]
+    fn init_root_inode_cache(&mut self) -> Result<(), VfsError> {
+        self.root_dir_fs_data = Some(Arc::new(Ext2FsSpecificFileData {
+            value: Either::B(Directory::new(
+                self,
+                self.get_inode(2, None)?,
+                OPEN_MODE_BINARY | OPEN_MODE_READ,
+            )?),
+        }));
+        Ok(())
     }
 }
 
@@ -987,17 +1094,10 @@ impl FileSystem for Ext2Volume {
 
     default_get_file_implementation!();
 
-    fn create_child(
-        &mut self,
-        _directory: &VfsFile,
-        _name: &[char],
-        _kind: VfsFileKind,
-    ) -> Result<VfsFile, VfsError> {
-        // TODO: Write support
-        Err(VfsError::ActionNotAllowed)
-    }
-
-    fn delete_file(&mut self, file: &VfsFile) -> Result<(), VfsError> {
+    fn get_stats(&mut self, file: &VfsFile) -> Result<FileStat, VfsError> {
+        if file.fs() != self.os_id() {
+            return Err(VfsError::FileSystemMismatch);
+        }
         let data = file.get_fs_specific_data();
         let data: &Ext2FsSpecificFileData = (*data)
             .as_any()
@@ -1005,8 +1105,138 @@ impl FileSystem for Ext2Volume {
             .ok_or(VfsError::FileSystemMismatch)?;
 
         match &data.value {
-            Either::A(inode) => self.delete_inode(inode)?,
-            Either::B(directory) => self.delete_inode(&directory.inode)?,
+            Either::A(inode) => Ok(FileStat {
+                size: inode.get_size(self),
+                permissions: inode.permissions.get() as u64,
+                flags: 0,
+                created_at: inode.ctime as u64,
+                modified_at: inode.atime as u64,
+                is_directory: false,
+                is_symlink: false,
+                owner_id: inode.uid as u64,
+                group_id: inode.gid as u64,
+            }),
+            Either::B(dir) => {
+                let inode = &dir.inode;
+                Ok(FileStat {
+                    size: 0,
+                    permissions: inode.permissions.get() as u64,
+                    flags: 0,
+                    created_at: inode.ctime as u64,
+                    modified_at: inode.atime as u64,
+                    is_directory: true,
+                    is_symlink: false,
+                    owner_id: inode.uid as u64,
+                    group_id: inode.gid as u64,
+                })
+            }
+        }
+    }
+
+    fn create_child(
+        &mut self,
+        directory: &VfsFile,
+        name: &[char],
+        kind: VfsFileKind,
+    ) -> Result<VfsFile, VfsError> {
+        if directory.fs() != self.os_id() {
+            return Err(VfsError::FileSystemMismatch);
+        }
+        if !directory.is_directory() {
+            return Err(VfsError::NotDirectory);
+        }
+
+        let data = directory.get_fs_specific_data();
+        let data: &Ext2FsSpecificFileData = (*data)
+            .as_any()
+            .downcast_ref::<Ext2FsSpecificFileData>()
+            .ok_or(VfsError::FileSystemMismatch)?;
+
+        let parent_inode = data
+            .value
+            .referenced()
+            .convert(|inode| inode.inode_i, |dir| dir.inode.inode_i);
+
+        match kind {
+            VfsFileKind::File => {
+                let inode = self.allocate_inode(
+                    0,
+                    0,
+                    InodeType::File,
+                    *InodePermissions::empty()
+                        .set(InodePermission::OwnerRead)
+                        .set(InodePermission::OtherWrite),
+                    InodeFlags::empty(),
+                    None,
+                )?;
+
+                self.add_inode_to_directory(parent_inode, inode, name, DirectoryEntryType::File)?;
+
+                if directory.name() == ['/'] {
+                    self.init_root_inode_cache()?;
+                }
+
+                self.get_file_for_inode(inode, Some(parent_inode), name.to_vec())
+            }
+            VfsFileKind::Directory => {
+                let inode = self.allocate_inode(
+                    0,
+                    0,
+                    InodeType::Directory,
+                    *InodePermissions::empty()
+                        .set(InodePermission::OwnerRead)
+                        .set(InodePermission::OtherWrite),
+                    InodeFlags::empty(),
+                    None,
+                )?;
+
+                self.add_inode_to_directory(
+                    parent_inode,
+                    inode,
+                    name,
+                    DirectoryEntryType::Directory,
+                )?;
+                self.init_directory_inode(inode, parent_inode)?;
+
+                if directory.name() == ['/'] {
+                    self.init_root_inode_cache()?;
+                }
+
+                self.get_file_for_inode(inode, Some(parent_inode), name.to_vec())
+            }
+            _ => Err(VfsError::ActionNotAllowed),
+        }
+    }
+
+    fn delete_file(&mut self, file: &VfsFile) -> Result<(), VfsError> {
+        if file.fs() != self.os_id() {
+            return Err(VfsError::FileSystemMismatch);
+        }
+
+        let data = file.get_fs_specific_data();
+        let data: &Ext2FsSpecificFileData = (*data)
+            .as_any()
+            .downcast_ref::<Ext2FsSpecificFileData>()
+            .ok_or(VfsError::FileSystemMismatch)?;
+
+        match &data.value {
+            Either::A(inode) => {
+                self.delete_inode(inode)?;
+
+                if inode.parent_inode == Some(2) {
+                    self.init_root_inode_cache()?;
+                }
+            }
+            Either::B(directory) => {
+                if directory.entries.len() > 2 {
+                    return Err(VfsError::DirectoryNotEmpty);
+                }
+                self.delete_inode(&directory.inode)?;
+
+                if directory.inode.parent_inode == Some(2) {
+                    self.init_root_inode_cache()?;
+                }
+            }
         }
 
         Ok(())
@@ -1022,13 +1252,7 @@ impl FileSystem for Ext2Volume {
         self.root_fs = Some(root_fs);
         self.os_id = os_id;
 
-        self.root_dir_fs_data = Some(Arc::new(Ext2FsSpecificFileData {
-            value: Either::B(Directory::new(
-                self,
-                self.get_inode(2, None)?,
-                OPEN_MODE_BINARY | OPEN_MODE_READ,
-            )?),
-        }));
+        self.init_root_inode_cache()?;
 
         self.get_root()
     }
@@ -1048,10 +1272,10 @@ impl FileSystem for Ext2Volume {
     }
 
     fn on_unmount(&mut self) -> Result<(), VfsError> {
+        self.flush()?;
         self.mount_point = None;
         self.root_fs = None;
         self.os_id = 0;
-        self.flush()?;
         unsafe { self.device._close()? };
         Ok(())
     }
@@ -1061,6 +1285,10 @@ impl FileSystem for Ext2Volume {
     }
 
     fn fopen(&mut self, file: &VfsFile, mode: u64) -> Result<u64, VfsError> {
+        if file.fs() != self.os_id() {
+            return Err(VfsError::FileSystemMismatch);
+        }
+
         let data = file.get_fs_specific_data();
         let data = (*data)
             .as_any()

@@ -282,6 +282,13 @@ impl FileSystem for DevFs {
         }
     }
 
+    fn get_stats(&mut self, file: &VfsFile) -> Result<FileStat, VfsError> {
+        let handle = self.fopen(file, 0)?;
+        let stats = self.fstat(handle);
+        self.fclose(handle)?;
+        stats
+    }
+
     fn get_mount_point(&mut self) -> Result<Option<VfsFile>, VfsError> {
         Ok(Some(
             self.mnt

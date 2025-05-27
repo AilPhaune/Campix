@@ -9,6 +9,7 @@ use crate::{
 use super::{superblock::ROFeature, Ext2Error, Ext2Volume};
 
 #[repr(C, packed)]
+#[derive(Debug, Clone)]
 pub struct RawInode {
     pub type_and_permissions: u16,
     pub uid: u16,

@@ -8,7 +8,7 @@ use data::file::{DirectoryEntry, File};
 use drivers::{
     fs::phys::ext2::Ext2Volume,
     pci,
-    vfs::{get_vfs, OPEN_MODE_BINARY, OPEN_MODE_READ, OPEN_MODE_WRITE},
+    vfs::{get_vfs, SeekPosition, OPEN_MODE_BINARY, OPEN_MODE_READ, OPEN_MODE_WRITE},
 };
 use memory::mem::OsMemoryRegion;
 use obsiboot::ObsiBootKernelParameters;
@@ -108,11 +108,27 @@ pub fn _start(obsiboot_ptr: u64) -> ! {
         }
 
         {
-            File::delete("/system/aaa").unwrap();
-            File::delete("/system/lost+found").unwrap();
-            File::delete("/system/obsiboot.conf").unwrap();
-            // DESTROY SYSTEM BECAUSE IT'S FUN
-            File::delete("/system/kernel64.elf").unwrap();
+            if let Some(stats) = File::get_stats("/system/foobar").unwrap() {
+                if !stats.is_directory {
+                    panic!("/system/foobar is not a directory");
+                }
+                println!("{:#?}", stats);
+            } else {
+                File::mkdir("/system/foobar").unwrap();
+            }
+            if let Some(stats) = File::get_stats("/system/foobar/bar").unwrap() {
+                println!("{:#?}", stats);
+            } else {
+                File::create("/system/foobar/bar", 0).unwrap();
+            }
+            let mut file = File::open(
+                "/system/foobar/bar",
+                OPEN_MODE_BINARY | OPEN_MODE_READ | OPEN_MODE_WRITE,
+            )
+            .unwrap();
+
+            file.seek(SeekPosition::FromEnd(0)).unwrap();
+            file.write(b"HELLO WORLD !\n").unwrap();
         }
 
         {

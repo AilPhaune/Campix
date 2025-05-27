@@ -273,6 +273,36 @@ impl FileHandle {
     }
 }
 
+#[repr(u8)]
+pub enum DirectoryEntryType {
+    Unknown = 0,
+    File = 1,
+    Directory = 2,
+    CharacterDevice = 3,
+    BlockDevice = 4,
+    BufferFile = 5,
+    SocketFile = 6,
+    Symlink = 7,
+}
+
+impl TryFrom<u8> for DirectoryEntryType {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(DirectoryEntryType::Unknown),
+            1 => Ok(DirectoryEntryType::File),
+            2 => Ok(DirectoryEntryType::Directory),
+            3 => Ok(DirectoryEntryType::CharacterDevice),
+            4 => Ok(DirectoryEntryType::BlockDevice),
+            5 => Ok(DirectoryEntryType::BufferFile),
+            6 => Ok(DirectoryEntryType::SocketFile),
+            7 => Ok(DirectoryEntryType::Symlink),
+            _ => Err(()),
+        }
+    }
+}
+
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 struct DirectoryEntryRaw {
@@ -284,7 +314,7 @@ struct DirectoryEntryRaw {
 
 #[derive(Debug, Clone)]
 pub struct DirectoryEntry {
-    iode: u32,
+    inode: u32,
     name: Vec<char>,
 }
 
@@ -294,7 +324,7 @@ impl DirectoryEntry {
     }
 
     pub fn inode(&self) -> u32 {
-        self.iode
+        self.inode
     }
 
     pub fn has_name(&self, name: &[char]) -> bool {
@@ -322,7 +352,11 @@ impl<'a> DirectoryIterator<'a> {
             .get_required_features()
             .has(RequiredFeature::DirectoryEntriesHaveTypeField);
         let size = inode.get_size(volume) as usize;
-        let buffer = alloc_boxed_slice::<u8>(volume.block_size as usize);
+        let bs = volume.block_size as usize;
+        if size % bs != 0 {
+            return Err(VfsError::InvalidDataStructure);
+        }
+        let buffer = alloc_boxed_slice::<u8>(bs);
         let handle = FileHandle::new(volume, inode, open_mode)?;
         Ok(Self {
             volume,
@@ -352,6 +386,12 @@ impl<'a> DirectoryIterator<'a> {
             self.buffer_idx = buffer_idx;
         }
         Ok(idx)
+    }
+
+    pub fn move_to_entry(&mut self, entry: &DirectoryIteratorEntry) -> Result<(), VfsError> {
+        self.idx = entry.offset as usize;
+        self.read_buffer()?;
+        Ok(())
     }
 
     pub fn delete_entry(&mut self, entry: DirectoryIteratorEntry) -> Result<(), VfsError> {
@@ -439,6 +479,151 @@ impl<'a> DirectoryIterator<'a> {
         done!();
         Ok(())
     }
+
+    pub fn insert_entry(
+        &mut self,
+        inode_i: u32,
+        name: &[u8],
+        entry_type: DirectoryEntryType,
+    ) -> Result<DirectoryIteratorEntry, VfsError> {
+        let raw_name_len = name.len();
+        if raw_name_len > 255 {
+            return Err(VfsError::NameTooLong);
+        }
+        // entries need to be 4 bytes aligned
+        let name_len = raw_name_len.next_multiple_of(4);
+        let needed_space = name_len + size_of::<DirectoryEntryRaw>();
+
+        macro_rules! done {
+            () => {
+                let pos = self.buffer_idx as u64 * self.volume.block_size as u64;
+                self.handle
+                    .seek(self.volume, SeekPosition::FromStart(pos))?;
+                self.handle.write(self.volume, &self.buffer)?;
+                self.handle.flush(self.volume)?;
+            };
+        }
+
+        // advance until we find a free slot
+        while let Some(entry) = self.next() {
+            if entry.entry.inode() == 0 && entry.rec_len >= needed_space as u64 {
+                // reuse entry
+                self.idx = entry.offset as usize;
+                let idx = self.read_buffer()?;
+
+                let mut entry_raw = unsafe {
+                    (self.buffer.as_ptr().add(idx) as *const DirectoryEntryRaw).read_unaligned()
+                };
+                entry_raw.inode = inode_i;
+                entry_raw.type_or_len_hi = if self.have_type_field {
+                    entry_type as u8
+                } else {
+                    0
+                };
+                entry_raw.len_lo = raw_name_len as u8;
+
+                let name_offset = idx + size_of::<DirectoryEntryRaw>();
+                let name_buffer = &mut self.buffer[name_offset..(name_offset + raw_name_len)];
+                name_buffer.copy_from_slice(name);
+
+                unsafe {
+                    (self.buffer.as_ptr().add(idx) as *mut DirectoryEntryRaw)
+                        .write_unaligned(entry_raw)
+                };
+
+                done!();
+
+                return self.next().ok_or(VfsError::UnknownError);
+            }
+
+            let entry_intrinsic_size =
+                size_of::<DirectoryEntryRaw>() + entry.entry.name().len().next_multiple_of(4);
+            let entry_free_size = entry.rec_len as usize - entry_intrinsic_size;
+
+            if entry_free_size >= needed_space {
+                // split entry
+                self.idx = entry.offset as usize;
+                let idx = self.read_buffer()?;
+
+                let mut old_entry_raw = unsafe {
+                    (self.buffer.as_ptr().add(idx) as *const DirectoryEntryRaw).read_unaligned()
+                };
+
+                old_entry_raw.entry_size = entry_intrinsic_size as u16;
+
+                unsafe {
+                    (self.buffer.as_ptr().add(idx) as *mut DirectoryEntryRaw)
+                        .write_unaligned(old_entry_raw)
+                };
+
+                self.idx += entry_intrinsic_size;
+                let idx = idx + entry_intrinsic_size;
+
+                let mut entry_raw = unsafe {
+                    (self.buffer.as_ptr().add(idx) as *const DirectoryEntryRaw).read_unaligned()
+                };
+
+                entry_raw.entry_size = entry_free_size as u16;
+                entry_raw.inode = inode_i;
+                entry_raw.type_or_len_hi = if self.have_type_field {
+                    entry_type as u8
+                } else {
+                    0
+                };
+                entry_raw.len_lo = raw_name_len as u8;
+
+                let name_offset = idx + size_of::<DirectoryEntryRaw>();
+                let name_buffer = &mut self.buffer[name_offset..(name_offset + raw_name_len)];
+                name_buffer.copy_from_slice(name);
+
+                unsafe {
+                    (self.buffer.as_ptr().add(idx) as *mut DirectoryEntryRaw)
+                        .write_unaligned(entry_raw)
+                };
+
+                done!();
+
+                return self.next().ok_or(VfsError::UnknownError);
+            }
+        }
+
+        // No more space, need to allocate a new block
+        let bs = self.volume.block_size as usize;
+        if bs > u16::MAX as usize {
+            return Err(VfsError::InvalidDataStructure);
+        }
+        if self.idx % bs != 0 {
+            return Err(VfsError::InvalidDataStructure);
+        }
+
+        self.idx = self.size;
+        self.size += bs;
+        self.handle.grow(self.volume, self.size as u64)?;
+
+        self.buffer_idx = self.idx / bs;
+        self.buffer.fill(0);
+
+        let entry_raw = DirectoryEntryRaw {
+            entry_size: bs as u16,
+            inode: inode_i,
+            len_lo: raw_name_len as u8,
+            type_or_len_hi: if self.have_type_field {
+                entry_type as u8
+            } else {
+                0
+            },
+        };
+
+        let name_offset = size_of::<DirectoryEntryRaw>();
+        let name_buffer = &mut self.buffer[name_offset..(name_offset + raw_name_len)];
+        name_buffer.copy_from_slice(name);
+
+        unsafe { (self.buffer.as_ptr() as *mut DirectoryEntryRaw).write_unaligned(entry_raw) };
+
+        done!();
+
+        self.next().ok_or(VfsError::UnknownError)
+    }
 }
 
 #[derive(Debug)]
@@ -480,7 +665,7 @@ impl<'a> Iterator for DirectoryIterator<'a> {
                 self.last_entry_offset = Some(begin_offset);
                 return Some(DirectoryIteratorEntry {
                     entry: DirectoryEntry {
-                        iode: entry_raw.inode,
+                        inode: entry_raw.inode,
                         name: name.iter().map(|c| *c as char).collect(),
                     },
                     offset: begin_offset,
@@ -519,7 +704,7 @@ impl Directory {
             DirectoryIterator::new(volume, inode.clone(), OPEN_MODE_BINARY | OPEN_MODE_WRITE)?;
 
         while let Some(next) = iterator.next() {
-            if next.entry.iode == entry_inode {
+            if next.entry.inode == entry_inode {
                 iterator.delete_entry(next)?;
                 return Ok(());
             }

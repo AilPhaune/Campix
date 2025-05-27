@@ -3,7 +3,8 @@ use core::fmt::Debug;
 use alloc::{string::String, vec::Vec};
 
 use crate::drivers::vfs::{
-    get_vfs, Arcrwb, FileStat, FileSystem, SeekPosition, VfsError, VfsFile, VfsFileKind,
+    get_vfs, Arcrwb, FileStat, FileSystem, PathTraverse, SeekPosition, VfsError, VfsFile,
+    VfsFileKind,
 };
 
 pub struct File {
@@ -47,6 +48,49 @@ impl File {
         })
     }
 
+    pub fn get_stats(path: &str) -> Result<Option<FileStat>, VfsError> {
+        let path = path.chars().collect::<Vec<char>>();
+        let fs = get_vfs();
+        let mut guard = fs.write();
+        guard.get_stats(&path)
+    }
+
+    pub fn create(path: &str, mode: u64) -> Result<File, VfsError> {
+        let path = path.chars().collect::<Vec<char>>();
+        let name_start = path
+            .iter()
+            .rposition(|c| *c == '/')
+            .ok_or(VfsError::InvalidArgument)?;
+
+        let dirname = &path[..name_start];
+        let filename = &path[name_start + 1..];
+        if filename.is_empty() {
+            return Err(VfsError::InvalidArgument);
+        }
+
+        let fs = get_vfs();
+        let mut guard = fs.write();
+
+        let directory = guard.get_file(dirname)?;
+
+        let fs = guard
+            .get_fs_by_id(directory.fs())
+            .ok_or(VfsError::FileSystemNotMounted)?;
+        drop(guard);
+        let mut guard = fs.write();
+        let file = guard.create_child(&directory, filename, VfsFileKind::File)?;
+        let handle = guard.fopen(&file, mode)?;
+        drop(guard);
+
+        Ok(File {
+            mode,
+            path,
+            fs,
+            file,
+            handle,
+        })
+    }
+
     pub fn delete(path: &str) -> Result<(), VfsError> {
         let path = path.chars().collect::<Vec<char>>();
         let fs = get_vfs();
@@ -60,6 +104,47 @@ impl File {
         guard.delete_file(&file)?;
         drop(guard);
         Ok(())
+    }
+
+    fn mkdir_impl(path: Vec<char>) -> Result<Directory, VfsError> {
+        let fs = get_vfs();
+        let wguard: &mut dyn FileSystem = &mut **fs.write();
+        let mut traverse = PathTraverse::new_owned(&path, wguard)?;
+        let mut made_dir = false;
+        loop {
+            match traverse.find_next() {
+                Ok(entry) => {
+                    if traverse.is_done() {
+                        return if made_dir {
+                            DirectoryEntry {
+                                full_name: path,
+                                entry,
+                            }
+                            .get_dir()
+                        } else {
+                            Err(VfsError::FileAlreadyExists)
+                        };
+                    }
+                }
+                Err(VfsError::PathNotFound) => {
+                    let entry = traverse.mkdir()?;
+                    if traverse.is_done() {
+                        return DirectoryEntry {
+                            full_name: path,
+                            entry,
+                        }
+                        .get_dir();
+                    }
+                    made_dir = true;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    pub fn mkdir(path: &str) -> Result<Directory, VfsError> {
+        let path = path.chars().collect::<Vec<char>>();
+        Self::mkdir_impl(path)
     }
 
     fn open_entry(entry: &DirectoryEntry, mode: u64) -> Result<File, VfsError> {
@@ -193,6 +278,7 @@ impl Drop for File {
     }
 }
 
+#[derive(Debug)]
 pub struct Directory {
     path: String,
 }

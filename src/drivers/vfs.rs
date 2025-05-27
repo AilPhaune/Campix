@@ -54,6 +54,11 @@ pub enum VfsError {
     InvalidArgument,
     MaximumSizeReached,
     EntryNotFound,
+    FileAlreadyExists,
+    InvalidDataStructure,
+    DirectoryNotEmpty,
+    NameTooLong,
+    Done,
     DriverError(Box<dyn core::fmt::Debug>),
 }
 
@@ -404,6 +409,9 @@ pub trait FileSystem: Send + Sync + core::fmt::Debug + AsAny {
     /// Returns the file at the given path, from this file system's root
     fn get_file(&mut self, path: &[char]) -> Result<VfsFile, VfsError>;
 
+    /// Returns the stats of the given file
+    fn get_stats(&mut self, file: &VfsFile) -> Result<FileStat, VfsError>;
+
     /// Creates a child file at the given path
     fn create_child(
         &mut self,
@@ -486,6 +494,10 @@ impl<'a> PathSplitterPeek<'a, '_> {
     pub fn apply(self) -> &'a [char] {
         self.splitter.last_part = Some(self.slice);
         self.splitter.idx = self.idx;
+        self.slice
+    }
+
+    pub fn get_path_part(&self) -> &'a [char] {
         self.slice
     }
 }
@@ -578,7 +590,7 @@ impl<'a, 'b> PathTraverse<'a, 'b> {
 
     pub fn find_next(&mut self) -> Result<VfsFile, VfsError> {
         if self.is_done() {
-            return Err(VfsError::PathNotFound);
+            return Err(VfsError::Done);
         }
         if let Some(fs) = self.curr.get_mounted_fs() {
             {
@@ -588,11 +600,41 @@ impl<'a, 'b> PathTraverse<'a, 'b> {
             self.fs = Either::new_left(fs.clone());
         }
 
-        let part = self.spliter.next_part();
+        let Some(peek) = self.spliter.peek() else {
+            return Err(VfsError::Done);
+        };
+        let part = peek.slice;
+
         let next = self.fs.referenced_mut().convert(
             |fs| fs.write().get_child(&self.curr, part),
             |fs| fs.get_child(&self.curr, part),
         )?;
+
+        peek.apply();
+
+        self.curr = next.clone();
+        Ok(next)
+    }
+
+    pub fn mkdir(&mut self) -> Result<VfsFile, VfsError> {
+        if self.is_done() {
+            return Err(VfsError::Done);
+        }
+
+        let Some(peek) = self.spliter.peek() else {
+            return Err(VfsError::Done);
+        };
+        let part = peek.slice;
+
+        let next = self.fs.referenced_mut().convert(
+            |fs| {
+                fs.write()
+                    .create_child(&self.curr, part, VfsFileKind::Directory)
+            },
+            |fs| fs.create_child(&self.curr, part, VfsFileKind::Directory),
+        )?;
+
+        peek.apply();
 
         self.curr = next.clone();
         Ok(next)
@@ -600,6 +642,10 @@ impl<'a, 'b> PathTraverse<'a, 'b> {
 
     pub fn extract_splitter(self) -> PathSplitter<'a> {
         self.spliter
+    }
+
+    pub fn get_splitter(&self) -> &PathSplitter<'a> {
+        &self.spliter
     }
 }
 
@@ -797,6 +843,28 @@ impl Vfs {
 
         Ok(())
     }
+
+    pub fn get_stats(&mut self, path: &[char]) -> Result<Option<FileStat>, VfsError> {
+        match self.get_file(path) {
+            Ok(file) => match file.get_mounted_fs() {
+                Some(fs) => {
+                    let mut guard = fs.write();
+                    let root = guard.get_root()?;
+                    guard.get_stats(&root).map(Some)
+                }
+                None => {
+                    let fs = self
+                        .get_fs_by_id(file.fs)
+                        .ok_or(VfsError::FileSystemNotMounted)?;
+
+                    let mut guard = fs.write();
+                    guard.get_stats(&file).map(Some)
+                }
+            },
+            Err(VfsError::PathNotFound) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -984,6 +1052,10 @@ impl FileSystem for Vfs {
     }
 
     default_get_file_implementation!();
+
+    fn get_stats(&mut self, _file: &VfsFile) -> Result<FileStat, VfsError> {
+        Err(VfsError::ActionNotAllowed)
+    }
 
     fn create_child(
         &mut self,
