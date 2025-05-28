@@ -32,7 +32,6 @@ use crate::{
             OPEN_MODE_WRITE,
         },
     },
-    println,
 };
 
 pub mod balloc;
@@ -851,7 +850,6 @@ impl Ext2Volume {
         group: u32,
         mut allocator: InodeAllocator,
     ) -> Result<(), VfsError> {
-        println!("handle_evicted_inode_bitmap_cache");
         allocator.write_dirty(self)?;
 
         let diff = *allocator.get_diff_usage();
@@ -872,7 +870,6 @@ impl Ext2Volume {
         for group in 0..self.block_group_count {
             if let Some(allocator) = self.get_inode_allocator_for_group(group)? {
                 if let Ok(inode) = allocator.alloc_inode() {
-                    println!("ALLOC INODE {inode}");
                     return Ok(inode);
                 }
             }
