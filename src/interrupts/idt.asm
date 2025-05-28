@@ -2,25 +2,39 @@ BITS 64
 
 %macro save_regs 0
     push rax
+    push rbx
     push rcx
     push rdx
     push rsi
     push rdi
+    push rbp
+    push rsp
     push r8
     push r9
     push r10
     push r11
+    push r12
+    push r13
+    push r14
+    push r15
 %endmacro
 
 %macro restore_regs 0
+    pop r15
+    pop r14
+    pop r13
+    pop r12
     pop r11
     pop r10
     pop r9
     pop r8
+    pop rsp
+    pop rbp
     pop rdi
     pop rsi
     pop rdx
     pop rcx
+    pop rbx
     pop rax
 %endmacro
 
@@ -46,7 +60,7 @@ isr_stub_%+%1:
     
     ; Args
     mov rdi, %1
-    lea rsi, [rsp + 9*8]
+    lea rsi, [rsp + 16*8]
 
     align_stack
     call idt_exception_handler
@@ -60,7 +74,7 @@ isr_stub_%+%1:
 isr_stub_%+%1:
     save_regs
     mov rdi, %1
-    lea rsi, [rsp + 9*8]
+    lea rsi, [rsp + 16*8]
     align_stack
     call idt_exception_handler
     pop_stack
@@ -71,19 +85,18 @@ isr_stub_%+%1:
 %macro isr_pic_stub 1
 isr_stub_%+%1:
     save_regs
-    push 0
     mov rdi, %1
-    lea rsi, [rsp + 9*8]
+    lea rsi, [rsp + 16*8]
     align_stack
     call idt_irq_handler
     pop_stack
-    pop rax
     restore_regs
     iretq
 %endmacro
 
 extern idt_exception_handler
 extern idt_irq_handler
+extern idt_software_interrupt_handler
 
 isr_no_err_stub 0
 isr_no_err_stub 1
@@ -135,10 +148,24 @@ isr_pic_stub    45
 isr_pic_stub    46
 isr_pic_stub    47
 
+%assign i 48
+%rep    208
+isr_stub_%+i:
+    save_regs
+    mov rdi, i
+    lea rsi, [rsp + 16*8]
+    align_stack
+    call idt_software_interrupt_handler
+    pop_stack
+    restore_regs
+    iretq
+%assign i i+1 
+%endrep
+
 global isr_stub_table
 isr_stub_table:
 %assign i 0 
-%rep    48
+%rep    256
     dq isr_stub_%+i
 %assign i i+1 
 %endrep

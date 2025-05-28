@@ -187,6 +187,12 @@ pub unsafe fn init_paging(
 pub unsafe fn map_page_4kb(virt: u64, phys: u64, flags: u64) {
     let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = split_virt_addr(virt);
 
+    let sub_flags = if virt >= 0xFFFF_8000_0000_0000 {
+        PAGE_PRESENT | PAGE_RW | PAGE_ACCESSED
+    } else {
+        PAGE_PRESENT | PAGE_RW | PAGE_ACCESSED | PAGE_USER
+    };
+
     let pml4_entry = &mut *PML4.add(pml4_idx);
     let pdpt_ptr = if *pml4_entry & PAGE_PRESENT != 0 {
         ptr_of_phys((*pml4_entry & 0x000F_FFFF_FFFF_F000) as *mut u64)
@@ -194,7 +200,7 @@ pub unsafe fn map_page_4kb(virt: u64, phys: u64, flags: u64) {
         let new = ALLOCATOR
             .alloc_page()
             .expect("Out of memory for page tables");
-        *pml4_entry = (new as u64 - DIRECT_MAPPING_OFFSET) | PAGE_PRESENT | PAGE_RW;
+        *pml4_entry = (new as u64 - DIRECT_MAPPING_OFFSET) | sub_flags;
         new as *mut u64
     };
 
@@ -205,7 +211,7 @@ pub unsafe fn map_page_4kb(virt: u64, phys: u64, flags: u64) {
         let new = ALLOCATOR
             .alloc_page()
             .expect("Out of memory for page tables");
-        *pdpt_entry = (new as u64 - DIRECT_MAPPING_OFFSET) | PAGE_PRESENT | PAGE_RW;
+        *pdpt_entry = (new as u64 - DIRECT_MAPPING_OFFSET) | sub_flags;
         new as *mut u64
     };
 
@@ -219,12 +225,12 @@ pub unsafe fn map_page_4kb(virt: u64, phys: u64, flags: u64) {
         let new = ALLOCATOR
             .alloc_page()
             .expect("Out of memory for page tables");
-        *pd_entry = (new as u64 - DIRECT_MAPPING_OFFSET) | PAGE_PRESENT | PAGE_RW;
+        *pd_entry = (new as u64 - DIRECT_MAPPING_OFFSET) | sub_flags;
         new as *mut u64
     };
 
     let pt_entry = &mut *pt_ptr.add(pt_idx);
-    *pt_entry = align_down(phys, PAGE_SIZE as u64) | flags | PAGE_PRESENT;
+    *pt_entry = align_down(phys, PAGE_SIZE as u64) | flags;
 
     asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags));
 }
@@ -235,6 +241,12 @@ pub unsafe fn map_page_4kb(virt: u64, phys: u64, flags: u64) {
 pub unsafe fn map_page_2mb(virt: u64, phys: u64, flags: u64) {
     let (pml4_idx, pdpt_idx, pd_idx, _) = split_virt_addr(virt);
 
+    let sub_flags = if virt >= 0xFFFF_8000_0000_0000 {
+        PAGE_PRESENT | PAGE_RW | PAGE_ACCESSED
+    } else {
+        PAGE_PRESENT | PAGE_RW | PAGE_ACCESSED | PAGE_USER
+    };
+
     let pml4_entry = &mut *PML4.add(pml4_idx);
     let pdpt_ptr = if *pml4_entry & PAGE_PRESENT != 0 {
         ptr_of_phys((*pml4_entry & 0x000F_FFFF_FFFF_F000) as *mut u64)
@@ -242,7 +254,7 @@ pub unsafe fn map_page_2mb(virt: u64, phys: u64, flags: u64) {
         let new = ALLOCATOR
             .alloc_page()
             .expect("Out of memory for page tables");
-        *pml4_entry = (new as u64 - DIRECT_MAPPING_OFFSET) | PAGE_PRESENT | PAGE_RW;
+        *pml4_entry = (new as u64 - DIRECT_MAPPING_OFFSET) | sub_flags;
         new as *mut u64
     };
 
@@ -253,12 +265,12 @@ pub unsafe fn map_page_2mb(virt: u64, phys: u64, flags: u64) {
         let new = ALLOCATOR
             .alloc_page()
             .expect("Out of memory for page tables");
-        *pdpt_entry = (new as u64 - DIRECT_MAPPING_OFFSET) | PAGE_PRESENT | PAGE_RW;
+        *pdpt_entry = (new as u64 - DIRECT_MAPPING_OFFSET) | sub_flags;
         new as *mut u64
     };
 
     let pd_entry = &mut *pd_ptr.add(pd_idx);
-    *pd_entry = align_down(phys, PAGE_SIZE_2MB as u64) | flags | PAGE_PRESENT | PAGE_HUGE;
+    *pd_entry = align_down(phys, PAGE_SIZE_2MB as u64) | flags | PAGE_HUGE;
 
     asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags));
 }

@@ -4,15 +4,23 @@
 use core::num::NonZeroUsize;
 
 use alloc::{boxed::Box, string::String, vec::Vec};
-use data::file::{DirectoryEntry, File};
+use data::{
+    calloc_boxed_slice,
+    file::{DirectoryEntry, File},
+};
 use drivers::{
     fs::phys::ext2::Ext2Volume,
     pci,
     vfs::{get_vfs, SeekPosition, OPEN_MODE_BINARY, OPEN_MODE_READ, OPEN_MODE_WRITE},
 };
+use gdt::{TSS_SELECTOR, USERLAND_CODE64_SELECTOR, USERLAND_DATA64_SELECTOR};
 use memory::mem::OsMemoryRegion;
 use obsiboot::ObsiBootKernelParameters;
-use paging::{init_paging, physical_to_virtual};
+use paging::{
+    init_paging, map_page_4kb, physical_to_virtual, DIRECT_MAPPING_OFFSET, PAGE_ACCESSED,
+    PAGE_PRESENT, PAGE_RW, PAGE_USER,
+};
+use process::task::TSS;
 
 extern crate alloc;
 
@@ -25,7 +33,10 @@ pub mod io;
 pub mod memory;
 pub mod obsiboot;
 pub mod paging;
+pub mod process;
 pub mod vesa;
+
+const PROGRAM: &[u8] = &[0xb8, 0x40, 0xe2, 0x01, 0x00, 0xcd, 0x80, 0xeb, 0xfe];
 
 #[no_mangle]
 pub fn _start(obsiboot_ptr: u64) -> ! {
@@ -229,6 +240,50 @@ unsafe fn kmain(obsiboot: ObsiBootKernelParameters) -> ! {
         println!("{}: {}x{}:{}bpp", mode, width, height, bpp);
     }
     println!();
+
+    let mut memory = calloc_boxed_slice(4096);
+    memory[0..PROGRAM.len()].copy_from_slice(PROGRAM);
+
+    let kstack = calloc_boxed_slice::<u8>(4096);
+    let ustack = calloc_boxed_slice::<u8>(4096);
+
+    map_page_4kb(
+        0x1_000_000,
+        ustack.as_ptr() as u64 - DIRECT_MAPPING_OFFSET,
+        PAGE_RW | PAGE_ACCESSED | PAGE_USER | PAGE_ACCESSED | PAGE_PRESENT,
+    );
+
+    map_page_4kb(
+        0x2_000_000,
+        memory.as_ptr() as u64 - DIRECT_MAPPING_OFFSET,
+        PAGE_RW | PAGE_ACCESSED | PAGE_USER | PAGE_ACCESSED | PAGE_PRESENT,
+    );
+
+    TSS.rsp0 = kstack.as_ptr() as u64 + 4096;
+
+    core::arch::asm!(
+        "cli",
+        "ltr ax",
+        "mov rsp, {kernel_stack_top}",
+        "mov rax, {user_data_sel}",
+        "mov ds, ax",
+        "mov es, ax",
+        "mov fs, ax",
+        "mov gs, ax",
+        "push rax",
+        "push {user_stack_top}",
+        "pushfq",
+        "or qword ptr [rsp], 0x200",
+        "push {user_code_sel}",
+        "push {user_entry}",
+        "iretq",
+        in("rax") TSS_SELECTOR as u64,
+        user_data_sel = const (USERLAND_DATA64_SELECTOR | 3) as u64,
+        user_code_sel = const (USERLAND_CODE64_SELECTOR | 3) as u64,
+        kernel_stack_top = in(reg) (kstack.as_ptr() as u64 + 4096),
+        user_stack_top = in(reg) 0x1_001_000u64,
+        user_entry = in(reg) 0x2_000_000u64,
+    );
 
     #[allow(clippy::empty_loop)]
     loop {}

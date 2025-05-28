@@ -7,7 +7,7 @@ use dc_access::{
 };
 use flags::{GRANULARITY_4KB, IS_32BIT, LONG_MODE};
 
-use crate::println;
+use crate::{println, process::task::TSS};
 
 pub mod dc_access {
     pub const PRESENT: u8 = 1 << 7;
@@ -70,6 +70,34 @@ impl GdtEntry {
     }
 }
 
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct TssEntry {
+    limit_low: u16,
+    base_low: u16,
+    base_mid: u8,
+    access: u8,
+    flags_limit_high: u8,
+    base_high: u8,
+    base_upper: u32,
+    reserved: u32,
+}
+
+impl TssEntry {
+    pub const fn new(base: u64, limit: u32) -> TssEntry {
+        TssEntry {
+            limit_low: (limit & 0xFFFF) as u16,
+            base_low: (base & 0xFFFF) as u16,
+            base_mid: ((base >> 16) & 0xFF) as u8,
+            access: 0x89, // Present + Available 64-bit TSS
+            flags_limit_high: (((limit >> 16) & 0x0F) as u8),
+            base_high: ((base >> 24) & 0xFF) as u8,
+            base_upper: (base >> 32) as u32,
+            reserved: 0,
+        }
+    }
+}
+
 pub enum GdtBits {
     Bits16,
     Bits32,
@@ -104,7 +132,8 @@ impl GdtRing {
     }
 }
 
-pub struct KernelGdt([GdtEntry; 7]);
+#[repr(C, packed)]
+pub struct KernelGdt([GdtEntry; 11], TssEntry);
 
 impl KernelGdt {
     pub const fn get_selector(
@@ -140,45 +169,78 @@ impl KernelGdt {
     }
 }
 
-pub const GDT: KernelGdt = KernelGdt([
-    GdtEntry::new(0, 0, 0, 0), // Null descriptor
-    GdtEntry::new(
-        0,
-        u32::MAX,
-        PRESENT | RING0 | CODE_SEGMENT | CODE_READ | ACCESSED,
-        GRANULARITY_4KB | IS_32BIT,
-    ), // 32-bit Code
-    GdtEntry::new(
-        0,
-        u32::MAX,
-        PRESENT | RING0 | DATA_SEGMENT | DATA_WRITE | ACCESSED,
-        GRANULARITY_4KB | IS_32BIT,
-    ), // 32-bit Data
-    GdtEntry::new(
-        0,
-        u32::MAX,
-        PRESENT | RING0 | CODE_SEGMENT | CODE_READ | ACCESSED,
-        0,
-    ), // 16-bit Code
-    GdtEntry::new(
-        0,
-        u32::MAX,
-        PRESENT | RING0 | DATA_SEGMENT | DATA_WRITE | ACCESSED,
-        0,
-    ), // 16-bit Data
-    GdtEntry::new(
-        0,
-        u32::MAX,
-        PRESENT | RING0 | CODE_SEGMENT | CODE_READ | ACCESSED,
-        GRANULARITY_4KB | LONG_MODE,
-    ), // 64-bit Code
-    GdtEntry::new(
-        0,
-        u32::MAX,
-        PRESENT | RING0 | DATA_SEGMENT | DATA_WRITE | ACCESSED,
-        GRANULARITY_4KB | LONG_MODE,
-    ), // 64-bit Data
-]);
+pub static GDT: KernelGdt = KernelGdt(
+    [
+        GdtEntry::new(0, 0, 0, 0), // Null descriptor
+        /*
+         * KERNEL
+         */
+        GdtEntry::new(
+            0,
+            u32::MAX,
+            PRESENT | RING0 | CODE_SEGMENT | CODE_READ | ACCESSED,
+            GRANULARITY_4KB | IS_32BIT,
+        ), // 32-bit Code
+        GdtEntry::new(
+            0,
+            u32::MAX,
+            PRESENT | RING0 | DATA_SEGMENT | DATA_WRITE | ACCESSED,
+            GRANULARITY_4KB | IS_32BIT,
+        ), // 32-bit Data
+        GdtEntry::new(
+            0,
+            u32::MAX,
+            PRESENT | RING0 | CODE_SEGMENT | CODE_READ | ACCESSED,
+            0,
+        ), // 16-bit Code
+        GdtEntry::new(
+            0,
+            u32::MAX,
+            PRESENT | RING0 | DATA_SEGMENT | DATA_WRITE | ACCESSED,
+            0,
+        ), // 16-bit Data
+        GdtEntry::new(
+            0,
+            u32::MAX,
+            PRESENT | RING0 | CODE_SEGMENT | CODE_READ | ACCESSED,
+            GRANULARITY_4KB | LONG_MODE,
+        ), // 64-bit Code
+        GdtEntry::new(
+            0,
+            u32::MAX,
+            PRESENT | RING0 | DATA_SEGMENT | DATA_WRITE | ACCESSED,
+            GRANULARITY_4KB | LONG_MODE,
+        ), // 64-bit Data
+        /*
+         * USERLAND
+         */
+        GdtEntry::new(
+            0,
+            u32::MAX,
+            PRESENT | RING3 | CODE_SEGMENT | CODE_READ | ACCESSED,
+            GRANULARITY_4KB | LONG_MODE,
+        ), // 64-bit Code
+        GdtEntry::new(
+            0,
+            u32::MAX,
+            PRESENT | RING3 | DATA_SEGMENT | DATA_WRITE | ACCESSED,
+            GRANULARITY_4KB | LONG_MODE,
+        ), // 64-bit Data
+        GdtEntry::new(
+            0,
+            u32::MAX,
+            PRESENT | RING3 | CODE_SEGMENT | CODE_READ | ACCESSED,
+            GRANULARITY_4KB | IS_32BIT,
+        ), // 32-bit Code
+        GdtEntry::new(
+            0,
+            u32::MAX,
+            PRESENT | RING3 | DATA_SEGMENT | DATA_WRITE | ACCESSED,
+            GRANULARITY_4KB | IS_32BIT,
+        ), // 32-bit Data
+    ],
+    TssEntry::new(0, 0),
+);
 
 pub const KERNEL_CODE_SELECTOR: usize = GDT
     .get_code_selector(GdtRing::Ring0, GdtBits::Bits64)
@@ -187,24 +249,57 @@ pub const KERNEL_DATA_SELECTOR: usize = GDT
     .get_data_selector(GdtRing::Ring0, GdtBits::Bits64)
     .unwrap();
 
+pub const USERLAND_DATA32_SELECTOR: usize = GDT
+    .get_data_selector(GdtRing::Ring3, GdtBits::Bits32)
+    .unwrap();
+pub const USERLAND_CODE32_SELECTOR: usize = GDT
+    .get_code_selector(GdtRing::Ring3, GdtBits::Bits32)
+    .unwrap();
+
+pub const USERLAND_DATA64_SELECTOR: usize = GDT
+    .get_data_selector(GdtRing::Ring3, GdtBits::Bits64)
+    .unwrap();
+pub const USERLAND_CODE64_SELECTOR: usize = GDT
+    .get_code_selector(GdtRing::Ring3, GdtBits::Bits64)
+    .unwrap();
+
+pub const TSS_SELECTOR: usize = GDT.0.len() * size_of::<GdtEntry>();
+
 #[no_mangle]
 pub static mut GDTR: GdtDescriptor = GdtDescriptor { limit: 0, base: 0 };
 
 #[allow(static_mut_refs)]
 pub(crate) unsafe fn init_gdtr() {
     GDTR = GdtDescriptor {
-        limit: size_of::<[GdtEntry; 7]>() as u16 - 1,
-        base: GDT.0.as_ptr() as u64,
+        limit: size_of::<KernelGdt>() as u16 - 1,
+        base: addr_of!(GDT) as u64,
     };
 
+    unsafe {
+        (&GDT.1 as *const TssEntry as *mut TssEntry).write(TssEntry::new(
+            addr_of!(TSS) as u64,
+            size_of::<TssEntry>() as u32 - 1,
+        ));
+    }
+
     println!("Kernel GDT at {:#016x}", GDT.0.as_ptr() as u64);
-    for i in 0..7 {
+    for i in 0..GDT.0.len() {
         println!("  Descriptor #{}: {:016x}", i, GDT.0[i].into());
     }
     println!("GDTR at {:#016x}", addr_of!(GDTR) as u64);
 
     println!("Kernel code selector: {:#x}", KERNEL_CODE_SELECTOR);
     println!("Kernel data selector: {:#x}", KERNEL_DATA_SELECTOR);
+    println!("Userland code32 selector: {:#x}", USERLAND_CODE32_SELECTOR);
+    println!("Userland data32 selector: {:#x}", USERLAND_DATA32_SELECTOR);
+    println!("Userland code64 selector: {:#x}", USERLAND_CODE64_SELECTOR);
+    println!("Userland data64 selector: {:#x}", USERLAND_DATA64_SELECTOR);
+
+    println!("Kernel TSS at {:#016x}", addr_of!(TSS) as u64);
+    println!("TSS Descriptor: {:#016x}", unsafe {
+        *(&GDT.1 as *const TssEntry as *const u128)
+    });
+
     println!();
 
     asm!("lgdt [{}]", in(reg) &GDTR, options(readonly, nostack, preserves_flags));
