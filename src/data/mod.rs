@@ -8,6 +8,7 @@ pub mod either;
 pub mod file;
 pub mod partition;
 pub mod permissions;
+pub mod regs;
 
 pub fn alloc_boxed_slice<T>(count: usize) -> Box<[T]> {
     let layout = Layout::array::<T>(count.max(1)).unwrap();

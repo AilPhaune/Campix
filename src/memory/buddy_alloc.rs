@@ -37,9 +37,9 @@ fn find_buddy(addr: u64, order: u64) -> u64 {
 
 impl BuddyPageAllocator {
     /// # Safety
-    /// `base_addr` must be page aligned
-    /// `page_count` must be greater than 0
-    /// The range `[base_addr, base_addr + page_count * PAGE_SIZE[` must be valid memory
+    /// `base_addr` must be page aligned <br>
+    /// `page_count` must be greater than 0 <br>
+    /// The range `[base_addr, base_addr + page_count * PAGE_SIZE[` must be valid memory <br>
     pub unsafe fn new(base_addr: u64, page_count: u64) -> Self {
         assert!((base_addr & (PAGE_SIZE - 1)) == 0 && page_count > 0);
         let mut alloc = Self {

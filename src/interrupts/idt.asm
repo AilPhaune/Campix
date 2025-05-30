@@ -45,12 +45,25 @@ BITS 64
     and rsp, ~0xF
     ; Push old rsp
     push rax
-    ; Push dummy value to align stack
-    push QWORD 0
+    ; Save old segments
+    xor rax, rax
+    mov ax, ds
+    push rax
+    mov ax, es
+    push rax
+    mov ax, fs
+    push rax
 %endmacro
 
-%macro pop_stack 0
+%macro pop_stack 0    
+    ; Restore segments
     pop rax
+    mov fs, ax
+    pop rax
+    mov es, ax
+    pop rax
+    mov ds, ax
+    ; Restore old rsp
     pop rsp
 %endmacro
 
@@ -67,11 +80,18 @@ isr_stub_%+%1:
     pop_stack
 
     restore_regs
+
+    ; Pop error code before returning
+    add rsp, 8
     iretq
 %endmacro
 
 %macro isr_no_err_stub 1
 isr_stub_%+%1:
+    ; Push 0 instead of error code as this exception has no pushed error code
+    sub rsp, 8
+    mov qword [rsp], 0
+
     save_regs
     mov rdi, %1
     lea rsi, [rsp + 16*8]
@@ -79,11 +99,17 @@ isr_stub_%+%1:
     call idt_exception_handler
     pop_stack
     restore_regs
+
+    add rsp, 8
     iretq
 %endmacro
 
 %macro isr_pic_stub 1
 isr_stub_%+%1:
+    ; Push 0 instead of error code so all interrupts have the same stack layout
+    sub rsp, 8
+    mov qword [rsp], 0
+
     save_regs
     mov rdi, %1
     lea rsi, [rsp + 16*8]
@@ -91,6 +117,8 @@ isr_stub_%+%1:
     call idt_irq_handler
     pop_stack
     restore_regs
+
+    add rsp, 8
     iretq
 %endmacro
 
@@ -151,6 +179,10 @@ isr_pic_stub    47
 %assign i 48
 %rep    208
 isr_stub_%+i:
+    ; Push 0 instead of error code so all interrupts have the same stack layout
+    sub rsp, 8
+    mov qword [rsp], 0
+
     save_regs
     mov rdi, i
     lea rsi, [rsp + 16*8]
@@ -158,6 +190,8 @@ isr_stub_%+i:
     call idt_software_interrupt_handler
     pop_stack
     restore_regs
+
+    add rsp, 8
     iretq
 %assign i i+1 
 %endrep

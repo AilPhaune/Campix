@@ -4,7 +4,8 @@ use alloc::{alloc::alloc_zeroed, boxed::Box, collections::BTreeSet, sync::Arc};
 use spin::RwLock;
 
 use crate::{
-    paging, permissions,
+    paging::{self, get_kernel_page_table},
+    permissions,
     vesa::{get_mode_info, VesaModeInfoStructure},
 };
 
@@ -66,11 +67,13 @@ impl VgaCharDevice {
     }
 
     unsafe fn ensure_framebuffer_mapped(fb: u64, size: u64) {
-        paging::map_memory(
+        let mut k = get_kernel_page_table().lock();
+        k.map_memory(
             fb,
             size,
             paging::DIRECT_MAPPING_OFFSET,
             paging::PAGE_ACCESSED | paging::PAGE_RW,
+            true,
         );
     }
 

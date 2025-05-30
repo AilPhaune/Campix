@@ -3,24 +3,32 @@
 
 use core::num::NonZeroUsize;
 
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::{
+    boxed::Box,
+    string::{String, ToString},
+    vec::Vec,
+};
 use data::{
     calloc_boxed_slice,
     file::{DirectoryEntry, File},
+    regs::rflags::{RFlag, RFlags},
 };
 use drivers::{
     fs::phys::ext2::Ext2Volume,
     pci,
     vfs::{get_vfs, SeekPosition, OPEN_MODE_BINARY, OPEN_MODE_READ, OPEN_MODE_WRITE},
 };
-use gdt::{TSS_SELECTOR, USERLAND_CODE64_SELECTOR, USERLAND_DATA64_SELECTOR};
 use memory::mem::OsMemoryRegion;
 use obsiboot::ObsiBootKernelParameters;
 use paging::{
-    init_paging, map_page_4kb, physical_to_virtual, DIRECT_MAPPING_OFFSET, PAGE_ACCESSED,
+    init_paging, physical_to_virtual, PageTable, DIRECT_MAPPING_OFFSET, PAGE_ACCESSED,
     PAGE_PRESENT, PAGE_RW, PAGE_USER,
 };
-use process::task::TSS;
+use process::{
+    memory::PROC_USER_STACK_TOP,
+    proc::{ThreadGPRegisters, ThreadState},
+    scheduler::{CreateProcessOptions, SCHEDULER},
+};
 
 extern crate alloc;
 
@@ -33,10 +41,17 @@ pub mod io;
 pub mod memory;
 pub mod obsiboot;
 pub mod paging;
+pub mod percpu;
 pub mod process;
 pub mod vesa;
 
-const PROGRAM: &[u8] = &[0xb8, 0x40, 0xe2, 0x01, 0x00, 0xcd, 0x80, 0xeb, 0xfe];
+const PROGRAM: &[u8] = &[
+    0xcd, 0x80, 0x48, 0xbf, 0x2a, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0xbe, 0x1b, 0x00, 0x00,
+    0x00, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xbb, 0x05, 0x00, 0x00, 0x00, 0x48, 0x83, 0xfb, 0x00, 0x74,
+    0x07, 0x48, 0xff, 0xcb, 0xcd, 0x80, 0xeb, 0xf3, 0xeb, 0xfe, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x20,
+    0x57, 0x6f, 0x72, 0x6c, 0x64, 0x20, 0x66, 0x72, 0x6f, 0x6d, 0x20, 0x75, 0x73, 0x65, 0x72, 0x6c,
+    0x61, 0x6e, 0x64, 0x0d, 0x0a,
+];
 
 #[no_mangle]
 pub fn _start(obsiboot_ptr: u64) -> ! {
@@ -69,9 +84,6 @@ pub fn _start(obsiboot_ptr: u64) -> ! {
         gdt::init_gdtr();
         println!("GDT initialized");
 
-        interrupts::init();
-        println!("Interrupts initialized");
-
         memory::mem::init(
             physical_to_virtual(obsiboot.ptr_to_memory_layout as u64) as *const OsMemoryRegion,
             obsiboot.memory_layout_entry_count as u64,
@@ -79,6 +91,12 @@ pub fn _start(obsiboot_ptr: u64) -> ! {
             obsiboot.usable_kernel_memory_start as u64,
         );
         println!("Memory allocator initialized");
+
+        percpu::init_per_cpu(0);
+        println!("Per-CPU initialized");
+
+        interrupts::init();
+        println!("Interrupts initialized");
 
         vesa::parse_current_mode(&obsiboot);
         println!("VESA initialized");
@@ -244,47 +262,53 @@ unsafe fn kmain(obsiboot: ObsiBootKernelParameters) -> ! {
     let mut memory = calloc_boxed_slice(4096);
     memory[0..PROGRAM.len()].copy_from_slice(PROGRAM);
 
-    let kstack = calloc_boxed_slice::<u8>(4096);
-    let ustack = calloc_boxed_slice::<u8>(4096);
+    let mut page_table = PageTable::alloc_new().unwrap();
 
-    map_page_4kb(
-        0x1_000_000,
-        ustack.as_ptr() as u64 - DIRECT_MAPPING_OFFSET,
-        PAGE_RW | PAGE_ACCESSED | PAGE_USER | PAGE_ACCESSED | PAGE_PRESENT,
-    );
+    // Copies the kernel's 256..512 pml4 entries
+    page_table.map_global_higher_half();
 
-    map_page_4kb(
+    // Process code
+    page_table.map_4kb(
         0x2_000_000,
         memory.as_ptr() as u64 - DIRECT_MAPPING_OFFSET,
-        PAGE_RW | PAGE_ACCESSED | PAGE_USER | PAGE_ACCESSED | PAGE_PRESENT,
+        PAGE_RW | PAGE_ACCESSED | PAGE_USER | PAGE_PRESENT,
+        false,
     );
 
-    TSS.rsp0 = kstack.as_ptr() as u64 + 4096;
+    let opts = CreateProcessOptions {
+        name: "sh".to_string(),
+        cmdline: "/system/bin/sh".to_string(),
+        cwd: "/".to_string(),
+        page_table,
+        main_thread_state: ThreadState {
+            gpregs: ThreadGPRegisters {
+                rax: 0,
+                rbx: 0,
+                rcx: 0,
+                rdx: 0,
+                rsi: 0,
+                rdi: 0,
+                r8: 0,
+                r9: 0,
+                r10: 0,
+                r11: 0,
+                r12: 0,
+                r13: 0,
+                r14: 0,
+                r15: 0,
+            },
+            rbp: PROC_USER_STACK_TOP,
+            rsp: PROC_USER_STACK_TOP,
+            rip: 0x2_000_000,
+            rflags: RFlags::empty()
+                .set(RFlag::InterruptFlag)
+                .set(RFlag::IOPL3)
+                .get(),
+            fs_base: 0,
+            gs_base: 0,
+        },
+    };
 
-    core::arch::asm!(
-        "cli",
-        "ltr ax",
-        "mov rsp, {kernel_stack_top}",
-        "mov rax, {user_data_sel}",
-        "mov ds, ax",
-        "mov es, ax",
-        "mov fs, ax",
-        "mov gs, ax",
-        "push rax",
-        "push {user_stack_top}",
-        "pushfq",
-        "or qword ptr [rsp], 0x200",
-        "push {user_code_sel}",
-        "push {user_entry}",
-        "iretq",
-        in("rax") TSS_SELECTOR as u64,
-        user_data_sel = const (USERLAND_DATA64_SELECTOR | 3) as u64,
-        user_code_sel = const (USERLAND_CODE64_SELECTOR | 3) as u64,
-        kernel_stack_top = in(reg) (kstack.as_ptr() as u64 + 4096),
-        user_stack_top = in(reg) 0x1_001_000u64,
-        user_entry = in(reg) 0x2_000_000u64,
-    );
-
-    #[allow(clippy::empty_loop)]
-    loop {}
+    SCHEDULER.create_process(opts);
+    SCHEDULER.schedule();
 }

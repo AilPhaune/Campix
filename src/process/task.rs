@@ -1,6 +1,17 @@
-use crate::interrupts::idt::Registers;
+#[repr(C, packed(4))]
+pub struct RawTaskStateSegment {
+    pub reserved0: u32,
+    pub rsp0: u64,
+    pub rsp1: u64,
+    pub rsp2: u64,
+    pub reserved1: [u32; 2],
+    pub ist: [u64; 7],
+    pub reserved2: [u32; 2],
+    pub reserved3: u16,
+    pub iopb: u16,
+}
 
-#[repr(C, packed)]
+#[derive(Debug)]
 pub struct TaskStateSegment {
     pub reserved0: u32,
     pub rsp0: u64,
@@ -13,26 +24,54 @@ pub struct TaskStateSegment {
     pub iopb: u16,
 }
 
-pub static mut TSS: TaskStateSegment = TaskStateSegment {
-    reserved0: 0,
-    rsp0: 0,
-    rsp1: 0,
-    rsp2: 0,
-    reserved1: [0; 2],
-    ist: [0; 7],
-    reserved2: [0; 2],
-    reserved3: 0,
-    iopb: 0,
-};
+#[repr(C, align(16))]
+pub struct AlignedTSS([u8; size_of::<RawTaskStateSegment>()]);
 
-pub struct ThreadControlBlock {
-    pub pid: u64,
-    pub id: u64,
+static mut TSS: AlignedTSS = AlignedTSS([0; size_of::<RawTaskStateSegment>()]);
 
-    pub kernel_stack: u64,
-    pub user_stack: u64,
+impl AlignedTSS {
+    pub fn get_tss_addr(&self) -> u64 {
+        self.0.as_ptr() as u64
+    }
+}
 
-    pub cr3_phys: u64,
+#[allow(static_mut_refs)]
+pub fn get_tss_addr() -> u64 {
+    unsafe { TSS.get_tss_addr() }
+}
 
-    pub registers: Registers,
+#[allow(static_mut_refs)]
+pub fn get_tss() -> TaskStateSegment {
+    let raw = unsafe { (TSS.get_tss_addr() as *mut RawTaskStateSegment).read_unaligned() };
+
+    TaskStateSegment {
+        reserved0: raw.reserved0,
+        rsp0: raw.rsp0,
+        rsp1: raw.rsp1,
+        rsp2: raw.rsp2,
+        reserved1: raw.reserved1,
+        ist: raw.ist,
+        reserved2: raw.reserved2,
+        reserved3: raw.reserved3,
+        iopb: raw.iopb,
+    }
+}
+
+#[allow(static_mut_refs)]
+pub fn set_tss(tss: &TaskStateSegment) {
+    let raw = RawTaskStateSegment {
+        reserved0: tss.reserved0,
+        rsp0: tss.rsp0,
+        rsp1: tss.rsp1,
+        rsp2: tss.rsp2,
+        reserved1: tss.reserved1,
+        ist: tss.ist,
+        reserved2: tss.reserved2,
+        reserved3: tss.reserved3,
+        iopb: tss.iopb,
+    };
+
+    unsafe {
+        (TSS.get_tss_addr() as *mut RawTaskStateSegment).write_unaligned(raw);
+    }
 }

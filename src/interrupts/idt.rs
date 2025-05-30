@@ -1,6 +1,20 @@
 use core::arch::asm;
 
-use crate::{gdt::KERNEL_CODE_SELECTOR, interrupts::pic::pic_send_eoi, println};
+use alloc::boxed::Box;
+
+use crate::{
+    data::{calloc_boxed_slice, regs::fs_gs_base::GsBase},
+    gdt::{KERNEL_CODE_SELECTOR, KERNEL_DATA_SELECTOR},
+    interrupts::pic::pic_send_eoi,
+    paging::{get_kernel_page_table, DIRECT_MAPPING_OFFSET, PAGE_ACCESSED, PAGE_PRESENT, PAGE_RW},
+    percpu::{core_id, get_per_cpu},
+    println,
+    process::{
+        memory::GLOB_KERNEL_STACK_TOP,
+        scheduler::SCHEDULER,
+        task::{get_tss, set_tss},
+    },
+};
 
 use super::handlers;
 
@@ -27,7 +41,7 @@ pub const USER_INT_FLAGS: u8 =
 #[derive(Clone, Copy)]
 struct IdtEntry64 {
     isr_low: u16,
-    kernerl_cs: u16,
+    kernel_cs: u16,
     ist: u8,
     flags: u8,
     isr_mid: u16,
@@ -39,7 +53,7 @@ impl IdtEntry64 {
     const fn missing() -> Self {
         Self {
             isr_low: 0,
-            kernerl_cs: 0,
+            kernel_cs: 0,
             ist: 0,
             flags: 0,
             isr_mid: 0,
@@ -51,7 +65,7 @@ impl IdtEntry64 {
     fn set_handler(&mut self, handler: extern "C" fn(), selector: u16, ist: u8, flags: u8) {
         let addr = handler as usize as u64;
         self.isr_low = (addr & 0xFFFF) as u16;
-        self.kernerl_cs = selector;
+        self.kernel_cs = selector;
         self.ist = ist;
         self.flags = flags;
         self.isr_mid = ((addr >> 16) & 0xFFFF) as u16;
@@ -69,11 +83,29 @@ static mut IDT: Idt = Idt {
     entries: [IdtEntry64::missing(); 256],
 };
 
-fn unhandled_interrupt(int: u64, _rsp: u64) {
-    panic!("Unhandled interrupt {:#02x} !", int);
+fn unhandled_interrupt(
+    int: u64,
+    _rsp: u64,
+    ifr: &mut InterruptFrameRegisters,
+    ifc: &mut InterruptFrameContext,
+    ife: Option<&mut InterruptFrameExtra>,
+) {
+    println!("Unhandled interrupt {:#02x}.", int);
+    println!("{:#?}", ifr);
+    println!("{:#?}", ifc);
+    println!("{:#?}", ife);
+    panic!("Unhandled interrupt dump complete.");
 }
 
-static mut HANDLERS: [fn(u64, u64); 256] = [unhandled_interrupt; 256];
+pub type HandlerFnType = fn(
+    u64,
+    u64,
+    &mut InterruptFrameRegisters,
+    &mut InterruptFrameContext,
+    Option<&mut InterruptFrameExtra>,
+);
+
+static mut HANDLERS: [HandlerFnType; 256] = [unhandled_interrupt; 256];
 
 #[repr(C, packed)]
 struct IdtDescriptor {
@@ -100,14 +132,46 @@ extern "C" {
 #[no_mangle]
 pub extern "C" fn idt_exception_handler(interrupt_num: u64, rsp: u64) {
     unsafe {
-        HANDLERS[interrupt_num as usize](interrupt_num, rsp);
+        let swap = GsBase::use_kernel_base();
+
+        let (ifr, ifc, ife) = common_enter_interrupt(rsp);
+
+        if let Some(ife) = ife {
+            HANDLERS[interrupt_num as usize](interrupt_num, rsp, ifr, ifc, Some(ife));
+
+            common_exit_interrupt(ifr, ifc, Some(ife));
+        } else {
+            HANDLERS[interrupt_num as usize](interrupt_num, rsp, ifr, ifc, None);
+
+            common_exit_interrupt(ifr, ifc, None);
+        }
+
+        if swap {
+            core::arch::asm!("swapgs");
+        }
     }
 }
 
 #[no_mangle]
 pub extern "C" fn idt_irq_handler(interrupt_num: u64, rsp: u64) {
     unsafe {
-        HANDLERS[interrupt_num as usize](interrupt_num, rsp);
+        let swap = GsBase::use_kernel_base();
+
+        let (ifr, ifc, ife) = common_enter_interrupt(rsp);
+
+        if let Some(ife) = ife {
+            HANDLERS[interrupt_num as usize](interrupt_num, rsp, ifr, ifc, Some(ife));
+
+            common_exit_interrupt(ifr, ifc, Some(ife));
+        } else {
+            HANDLERS[interrupt_num as usize](interrupt_num, rsp, ifr, ifc, None);
+
+            common_exit_interrupt(ifr, ifc, None);
+        }
+
+        if swap {
+            core::arch::asm!("swapgs");
+        }
     }
 
     pic_send_eoi(interrupt_num as u8 - 32);
@@ -116,9 +180,66 @@ pub extern "C" fn idt_irq_handler(interrupt_num: u64, rsp: u64) {
 #[no_mangle]
 pub extern "C" fn idt_software_interrupt_handler(interrupt_num: u64, rsp: u64) {
     unsafe {
-        HANDLERS[interrupt_num as usize](interrupt_num, rsp);
+        let mut ds: u16;
+        let mut es: u16;
+        let mut ss: u16;
+
+        asm!(
+            "mov {ds:x}, ds",
+            "mov {es:x}, es",
+            "mov {ss:x}, ss",
+            ds = out(reg) ds,
+            es = out(reg) es,
+            ss = out(reg) ss,
+            options(readonly, nostack, preserves_flags)
+        );
+
+        asm!(
+            "mov ds, {data_seg:x}",
+            "mov es, {data_seg:x}",
+            "mov ss, {data_seg:x}",
+            data_seg = in(reg) KERNEL_DATA_SELECTOR,
+            options(readonly, nostack, preserves_flags)
+        );
+
+        let swap = GsBase::use_kernel_base();
+
+        let (ifr, ifc, ife) = common_enter_interrupt(rsp);
+
+        if let Some(ife) = ife {
+            HANDLERS[interrupt_num as usize](interrupt_num, rsp, ifr, ifc, Some(ife));
+
+            common_exit_interrupt(ifr, ifc, Some(ife));
+        } else {
+            HANDLERS[interrupt_num as usize](interrupt_num, rsp, ifr, ifc, None);
+
+            common_exit_interrupt(ifr, ifc, None);
+        }
+
+        if swap {
+            core::arch::asm!("swapgs");
+        }
+
+        asm!(
+            "mov ds, {ds:x}",
+            "mov es, {es:x}",
+            "mov ss, {ss:x}",
+            ds = in(reg) ds,
+            es = in(reg) es,
+            ss = in(reg) ss,
+            options(readonly, nostack, preserves_flags)
+        );
     }
 }
+
+struct IstStack {
+    data: Box<[u64]>,
+    mapped_virt: u64,
+    mapped_virt_top: u64,
+}
+
+static mut IST_STACKS: [Option<IstStack>; 7] = [const { None }; 7];
+const STACK_SEPARATION: u64 = 8 * 1024 * 1024 * 1024; // 8GiB
 
 pub fn init_interrupts() {
     unsafe {
@@ -127,76 +248,152 @@ pub fn init_interrupts() {
         }
         IDT.entries[0x80].flags = USER_INT_FLAGS;
 
-        HANDLERS[0x20] = handlers::irq0_timer::handler;
-        HANDLERS[0x21] = handlers::irq1_keyboard::handler;
+        let mut curr_ist_top = GLOB_KERNEL_STACK_TOP - STACK_SEPARATION;
+        let mut kpages = get_kernel_page_table().lock();
+        let mut tss = get_tss();
+        #[allow(static_mut_refs)]
+        for (i, stack) in IST_STACKS.iter_mut().enumerate() {
+            // Allocate 2Mb stack
+            let ist = IstStack {
+                data: calloc_boxed_slice(2 * 1024 * 1024),
+                mapped_virt: curr_ist_top,
+                mapped_virt_top: curr_ist_top + 2 * 1024 * 1024,
+            };
 
-        HANDLERS[0x06] = inv_opcode;
-        HANDLERS[0x0E] = pgfault;
+            kpages.map_2mb(
+                ist.mapped_virt,
+                ist.data.as_ptr() as u64 - DIRECT_MAPPING_OFFSET,
+                PAGE_RW | PAGE_ACCESSED | PAGE_PRESENT,
+                true,
+            );
 
-        HANDLERS[0x80] = x80_handle;
+            curr_ist_top -= STACK_SEPARATION;
+            tss.ist[i] = ist.mapped_virt_top;
+            *stack = Some(ist);
+        }
+        set_tss(&tss);
+
+        IDT.entries[0x0E].ist = 1;
+        IDT.entries[0x08].ist = 2;
+
+        HANDLERS[0x20] = handlers::irq::irq0_timer::handler;
+        HANDLERS[0x21] = handlers::irq::irq1_keyboard::handler;
+
+        HANDLERS[0x06] = handlers::exception::exc_6_invalid_opcode::handler;
+        HANDLERS[0x0E] = handlers::exception::exc_e_page_fault::handler;
+
+        HANDLERS[0x80] = handlers::syscall::int80h::handler;
 
         #[allow(static_mut_refs)]
         load_idt(&IDT);
     }
 }
 
-fn inv_opcode(_ist: u64, rsp: u64) {
-    unsafe {
-        println!("Invalid opcode");
-        println!("rsp = {:#x}", rsp);
-
-        for i in -20..20 {
-            println!("[rsp + 8*{}] = {:#x}", i, *(rsp as *const u64).offset(i));
-        }
-
-        let rip = *(rsp as *const u64);
-        println!("rip = {:#x}", rip);
-
-        panic!("int 0x06");
-    }
-}
-
-fn pgfault(_ist: u64, _rsp: u64) {
-    panic!("Page fault");
-}
-
-#[repr(C, packed)]
+#[repr(C, packed(8))]
 #[derive(Debug, Clone)]
-pub struct Registers {
-    r15: u64,
-    r14: u64,
-    r13: u64,
-    r12: u64,
-    r11: u64,
-    r10: u64,
-    r9: u64,
-    r8: u64,
-    rsp: u64,
-    rbp: u64,
-    rdi: u64,
-    rsi: u64,
-    rdx: u64,
-    rcx: u64,
-    rbx: u64,
-    rax: u64,
+pub struct InterruptFrameRegisters {
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rsp: u64,
+    pub rbp: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub rbx: u64,
+    pub rax: u64,
 }
 
-fn x80_handle(_ist: u64, rsp: u64) {
-    unsafe {
-        println!("x80 handle");
+#[repr(C, packed(8))]
+#[derive(Debug, Clone)]
+pub struct InterruptFrameContext {
+    pub exception_error_code: u64,
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+}
 
-        println!(
-            "regs = {:#?}",
-            ((rsp - size_of::<Registers>() as u64) as *const Registers).read_unaligned()
-        );
+#[repr(C, packed(8))]
+#[derive(Debug, Clone)]
+pub struct InterruptFrameExtra {
+    pub rsp: u64,
+    pub ss: u64,
+}
 
-        println!("rsp = {:#x}", rsp);
+unsafe fn get_interrupt_context(
+    rsp: u64,
+) -> (
+    &'static mut InterruptFrameRegisters,
+    &'static mut InterruptFrameContext,
+    Option<&'static mut InterruptFrameExtra>,
+) {
+    let ifr =
+        &mut *((rsp - size_of::<InterruptFrameRegisters>() as u64) as *mut InterruptFrameRegisters);
+    let ifc = &mut *(rsp as *mut InterruptFrameContext);
 
-        for i in -20..20 {
-            println!("[rsp + 8*{}] = {:#x}", i, *(rsp as *const u64).offset(i));
-        }
+    if ifc.cs & 0b11 != 0 {
+        // There was a privilege level change so the cpu pushed extra information
 
-        let rip = *(rsp as *const u64);
-        println!("rip = {:#x}", rip);
+        let ife =
+            &mut *((rsp + size_of::<InterruptFrameContext>() as u64) as *mut InterruptFrameExtra);
+
+        return (ifr, ifc, Some(ife));
     }
+
+    (ifr, ifc, None)
+}
+
+fn common_exit_interrupt(
+    _ifr: &mut InterruptFrameRegisters,
+    ifc: &mut InterruptFrameContext,
+    _ife: Option<&mut InterruptFrameExtra>,
+) {
+    let per_cpu = get_per_cpu();
+
+    if ifc.cs & 0b11 != 0 {
+        // If the interrupt comes from lower privilege level, we need to lock back the thread
+        if let Some(tid) = per_cpu.running_tid {
+            if let Some(thread) = SCHEDULER.get_thread(tid) {
+                let mut lock = thread.thread.running_cpu.lock();
+                *lock = Some(core_id());
+                core::mem::forget(lock);
+            }
+        }
+    }
+}
+
+fn common_enter_interrupt(
+    rsp: u64,
+) -> (
+    &'static mut InterruptFrameRegisters,
+    &'static mut InterruptFrameContext,
+    Option<&'static mut InterruptFrameExtra>,
+) {
+    let per_cpu = get_per_cpu();
+
+    let (ifr, ifc, ife) = unsafe { get_interrupt_context(rsp) };
+
+    if ifc.cs & 0b11 != 0 {
+        // If the interrupt comes from lower privilege level, we need to unlock the thread as it is not running anymore
+
+        if let Some(tid) = per_cpu.running_tid {
+            if let Some(thread) = SCHEDULER.get_thread(tid) {
+                unsafe {
+                    thread.thread.running_cpu.force_unlock();
+
+                    let mut lock = thread.thread.running_cpu.lock();
+                    *lock = None;
+                    drop(lock);
+                }
+            }
+        }
+    }
+
+    (ifr, ifc, ife)
 }

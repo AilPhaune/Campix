@@ -7,7 +7,10 @@ use dc_access::{
 };
 use flags::{GRANULARITY_4KB, IS_32BIT, LONG_MODE};
 
-use crate::{println, process::task::TSS};
+use crate::{
+    println,
+    process::task::{get_tss_addr, RawTaskStateSegment},
+};
 
 pub mod dc_access {
     pub const PRESENT: u8 = 1 << 7;
@@ -277,8 +280,8 @@ pub(crate) unsafe fn init_gdtr() {
 
     unsafe {
         (&GDT.1 as *const TssEntry as *mut TssEntry).write(TssEntry::new(
-            addr_of!(TSS) as u64,
-            size_of::<TssEntry>() as u32 - 1,
+            get_tss_addr(),
+            size_of::<RawTaskStateSegment>() as u32 - 1,
         ));
     }
 
@@ -294,15 +297,21 @@ pub(crate) unsafe fn init_gdtr() {
     println!("Userland data32 selector: {:#x}", USERLAND_DATA32_SELECTOR);
     println!("Userland code64 selector: {:#x}", USERLAND_CODE64_SELECTOR);
     println!("Userland data64 selector: {:#x}", USERLAND_DATA64_SELECTOR);
+    println!("TSS selector: {:#x}", TSS_SELECTOR);
 
-    println!("Kernel TSS at {:#016x}", addr_of!(TSS) as u64);
-    println!("TSS Descriptor: {:#016x}", unsafe {
+    println!("Kernel TSS at {:#016x}", get_tss_addr());
+    println!("TSS entry: {:#032x}", unsafe {
         *(&GDT.1 as *const TssEntry as *const u128)
     });
 
     println!();
 
     asm!("lgdt [{}]", in(reg) &GDTR, options(readonly, nostack, preserves_flags));
+    asm!(
+        "ltr {0:x}",
+        in(reg) TSS_SELECTOR as u16,
+        options(nostack, preserves_flags),
+    );
     asm!(
         "push {0}",
         "lea rax, [rip + 2f]",
@@ -311,11 +320,12 @@ pub(crate) unsafe fn init_gdtr() {
         "2:",
         "mov ds, {1}",
         "mov es, {1}",
-        "mov fs, {1}",
-        "mov gs, {1}",
+        "mov fs, {2:e}",
+        "mov gs, {2:e}",
         "mov ss, {1}",
         in(reg) KERNEL_CODE_SELECTOR,
         in(reg) KERNEL_DATA_SELECTOR,
+        in(reg) 0,
         out("rax") _,
         options(nostack)
     );

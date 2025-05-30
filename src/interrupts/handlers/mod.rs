@@ -1,2 +1,3 @@
-pub mod irq0_timer;
-pub mod irq1_keyboard;
+pub mod exception;
+pub mod irq;
+pub mod syscall;

@@ -5,6 +5,7 @@ use crate::{
         handle_keyboard_event, AcpiKey, Key, KeyModifiers, KeyboardEvent, KeyboardEventKind,
         MultimediaKey,
     },
+    interrupts::idt::{InterruptFrameContext, InterruptFrameExtra, InterruptFrameRegisters},
     io::inb,
     println,
 };
@@ -368,7 +369,13 @@ impl Kbdmap {
 static mut KBD_MAP: Kbdmap = Kbdmap::Qwerty;
 
 #[allow(static_mut_refs)]
-pub fn handler(_ist: u64, _rsp: u64) {
+pub fn handler(
+    _ist: u64,
+    _rsp: u64,
+    _ifr: &mut InterruptFrameRegisters,
+    _ifc: &mut InterruptFrameContext,
+    _ife: Option<&mut InterruptFrameExtra>,
+) {
     let key = read_keyboard_layout_en_us();
 
     let Some(down_keys) = (unsafe {
