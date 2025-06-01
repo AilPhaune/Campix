@@ -8,33 +8,23 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
-use data::{
-    calloc_boxed_slice,
-    file::{DirectoryEntry, File},
-    regs::rflags::{RFlag, RFlags},
-};
+use data::file::{DirectoryEntry, File};
 use drivers::{
     fs::phys::ext2::Ext2Volume,
     pci,
-    vfs::{get_vfs, SeekPosition, OPEN_MODE_BINARY, OPEN_MODE_READ, OPEN_MODE_WRITE},
+    vfs::{get_vfs, OPEN_MODE_BINARY, OPEN_MODE_READ, OPEN_MODE_WRITE},
 };
 use memory::mem::OsMemoryRegion;
 use obsiboot::ObsiBootKernelParameters;
-use paging::{
-    init_paging, physical_to_virtual, PageTable, DIRECT_MAPPING_OFFSET, PAGE_ACCESSED,
-    PAGE_PRESENT, PAGE_RW, PAGE_USER,
-};
-use process::{
-    memory::PROC_USER_STACK_TOP,
-    proc::{ThreadGPRegisters, ThreadState},
-    scheduler::{CreateProcessOptions, SCHEDULER},
-};
+use paging::{init_paging, physical_to_virtual};
+use process::{executable::parse_executable, scheduler::SCHEDULER};
 
 extern crate alloc;
 
 pub mod data;
 pub mod drivers;
 pub mod e9;
+pub mod formats;
 pub mod gdt;
 pub mod interrupts;
 pub mod io;
@@ -44,16 +34,6 @@ pub mod paging;
 pub mod percpu;
 pub mod process;
 pub mod vesa;
-
-const PROGRAM_A: &[u8] = &[
-    0x48, 0xbf, 0x18, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0xbe, 0x01, 0x00, 0x00, 0x00, 0xb8,
-    0x01, 0x00, 0x00, 0x00, 0xcd, 0x80, 0xeb, 0xfc, 0x41,
-];
-
-const PROGRAM_B: &[u8] = &[
-    0x48, 0xbf, 0x18, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0xbe, 0x01, 0x00, 0x00, 0x00, 0xb8,
-    0x01, 0x00, 0x00, 0x00, 0xcd, 0x80, 0xeb, 0xfc, 0x42,
-];
 
 #[no_mangle]
 pub fn _start(obsiboot_ptr: u64) -> ! {
@@ -136,38 +116,6 @@ pub fn _start(obsiboot_ptr: u64) -> ! {
             let directory = DirectoryEntry::of("/").unwrap();
             dumpfs_tree(&directory, 0);
             println!();
-        }
-
-        {
-            if let Some(stats) = File::get_stats("/system/foobar").unwrap() {
-                if !stats.is_directory {
-                    panic!("/system/foobar is not a directory");
-                }
-                println!("{:#?}", stats);
-            } else {
-                File::mkdir("/system/foobar").unwrap();
-            }
-            if let Some(stats) = File::get_stats("/system/foobar/bar").unwrap() {
-                println!("{:#?}", stats);
-            } else {
-                File::create("/system/foobar/bar", 0).unwrap();
-            }
-            let mut file = File::open(
-                "/system/foobar/bar",
-                OPEN_MODE_BINARY | OPEN_MODE_READ | OPEN_MODE_WRITE,
-            )
-            .unwrap();
-
-            file.seek(SeekPosition::FromEnd(0)).unwrap();
-            file.write(b"HELLO WORLD !\n").unwrap();
-        }
-
-        {
-            let vfs = get_vfs();
-            let mut wguard = vfs.write();
-            wguard
-                .unmount(&"system".chars().collect::<Vec<char>>())
-                .unwrap();
         }
 
         kmain(obsiboot);
@@ -261,107 +209,58 @@ unsafe fn kmain(obsiboot: ObsiBootKernelParameters) -> ! {
     }
     println!();
 
-    let mut memory_a = calloc_boxed_slice(4096);
-    memory_a[0..PROGRAM_A.len()].copy_from_slice(PROGRAM_A);
-
-    let mut page_table_a = PageTable::alloc_new().unwrap();
-
-    // Copies the kernel's 256..512 pml4 entries
-    page_table_a.map_global_higher_half();
-
-    // Process code
-    page_table_a.map_4kb(
-        0x2_000_000,
-        memory_a.as_ptr() as u64 - DIRECT_MAPPING_OFFSET,
-        PAGE_RW | PAGE_ACCESSED | PAGE_USER | PAGE_PRESENT,
-        false,
-    );
-
-    let opts = CreateProcessOptions {
-        name: "sh".to_string(),
-        cmdline: "/system/bin/sh".to_string(),
-        cwd: "/".to_string(),
-        page_table: page_table_a,
-        main_thread_state: ThreadState {
-            gpregs: ThreadGPRegisters {
-                rax: 0,
-                rbx: 0,
-                rcx: 0,
-                rdx: 0,
-                rsi: 0,
-                rdi: 0,
-                r8: 0,
-                r9: 0,
-                r10: 0,
-                r11: 0,
-                r12: 0,
-                r13: 0,
-                r14: 0,
-                r15: 0,
-            },
-            rbp: PROC_USER_STACK_TOP,
-            rsp: PROC_USER_STACK_TOP,
-            rip: 0x2_000_000,
-            rflags: RFlags::empty()
-                .set(RFlag::InterruptFlag)
-                .set(RFlag::IOPL3)
-                .get(),
-            fs_base: 0,
-            gs_base: 0,
-        },
+    let stats = match File::get_stats("/system/sysinit") {
+        Ok(Some(stats)) => stats,
+        Ok(None) => {
+            println!("Initial executable /system/sysinit not found, make sure it exists in the system partition, then reboot.");
+            println!();
+            panic!("Campix: failed to boot...");
+        }
+        Err(err) => {
+            println!("Could not get stats for /system/sysinit");
+            println!("Error: {:#?}", err);
+            println!();
+            panic!("Campix: failed to boot...");
+        }
     };
-    SCHEDULER.create_process(opts);
 
-    let mut memory_b = calloc_boxed_slice(4096);
-    memory_b[0..PROGRAM_B.len()].copy_from_slice(PROGRAM_B);
+    if !stats.is_file {
+        println!("Initial executable /system/sysinit is not a file, make sure it exists in the system partition and that it is not a symlink.");
+        println!();
+        panic!("Campix: failed to boot...");
+    }
 
-    let mut page_table_b = PageTable::alloc_new().unwrap();
-
-    // Copies the kernel's 256..512 pml4 entries
-    page_table_b.map_global_higher_half();
-
-    // Process code
-    page_table_b.map_4kb(
-        0x2_000_000,
-        memory_b.as_ptr() as u64 - DIRECT_MAPPING_OFFSET,
-        PAGE_RW | PAGE_ACCESSED | PAGE_USER | PAGE_PRESENT,
-        false,
-    );
-
-    let opts = CreateProcessOptions {
-        name: "ls".to_string(),
-        cmdline: "/system/bin/ls".to_string(),
-        cwd: "/".to_string(),
-        page_table: page_table_b,
-        main_thread_state: ThreadState {
-            gpregs: ThreadGPRegisters {
-                rax: 0,
-                rbx: 0,
-                rcx: 0,
-                rdx: 0,
-                rsi: 0,
-                rdi: 0,
-                r8: 0,
-                r9: 0,
-                r10: 0,
-                r11: 0,
-                r12: 0,
-                r13: 0,
-                r14: 0,
-                r15: 0,
-            },
-            rbp: PROC_USER_STACK_TOP,
-            rsp: PROC_USER_STACK_TOP,
-            rip: 0x2_000_000,
-            rflags: RFlags::empty()
-                .set(RFlag::InterruptFlag)
-                .set(RFlag::IOPL3)
-                .get(),
-            fs_base: 0,
-            gs_base: 0,
-        },
+    let executable = match parse_executable("/system/sysinit") {
+        Ok(executable) => executable,
+        Err(err) => {
+            println!("Could not parse /system/sysinit");
+            println!("Errors: {:#?}", err);
+            println!();
+            panic!("Campix: failed to boot...");
+        }
     };
-    SCHEDULER.create_process(opts);
 
+    println!("{:#?}", executable);
+
+    let options = match executable.create_process(
+        "sysinit".to_string(),
+        "/system/sysinit".to_string(),
+        "/".to_string(),
+        0,
+        0,
+        alloc::vec![],
+    ) {
+        Ok(options) => options,
+        Err(err) => {
+            println!("Could not create process /system/sysinit");
+            println!("Error: {:#?}", err);
+            println!();
+            panic!("Campix: failed to boot...");
+        }
+    };
+
+    println!("{:#?}", options);
+
+    SCHEDULER.create_process(options);
     SCHEDULER.schedule();
 }

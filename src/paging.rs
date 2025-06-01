@@ -14,6 +14,7 @@ pub struct FreePage {
 }
 
 pub trait PageAllocator {
+    /// Allocates a new page and returns its virtual address in direct mapping. Does not clear the page
     fn alloc_page(&mut self) -> Option<*mut u8>;
     fn free_page(&mut self, page: *mut u8);
 }
@@ -47,8 +48,6 @@ impl PageAllocator for SimplePageAllocator {
                     (*free_page).next
                 };
             };
-
-            core::ptr::write_bytes(free_page as *mut u8, 0, 4096);
 
             Some(free_page as *mut u8)
         }
@@ -244,6 +243,9 @@ impl Table {
         if value & PAGE_PRESENT == 0 {
             if ADD_IF_EMPTY {
                 let ptr = allocator.alloc_page()? as *mut Table;
+                unsafe {
+                    core::ptr::write_bytes(ptr, 0, 1);
+                }
                 self.0[idx] = ((ptr as u64) - DIRECT_MAPPING_OFFSET) | sub_flags;
             } else {
                 return None;
@@ -427,6 +429,8 @@ impl PageTable {
                 );
                 return None;
             };
+
+            core::ptr::write_bytes(pml4, 0, 1);
 
             Some(Self {
                 allocator: allocator as *mut dyn PageAllocator,

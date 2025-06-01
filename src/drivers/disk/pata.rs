@@ -793,6 +793,7 @@ impl DevFsDriver for PataDevfsDriver {
             size: len,
             is_directory: false,
             is_symlink: false,
+            is_file: true,
             permissions: permissions!(Owner:Read, Owner:Write).to_u64(),
             owner_id: 0,
             group_id: 0,

@@ -1116,6 +1116,7 @@ impl FileSystem for Ext2Volume {
                 modified_at: inode.atime as u64,
                 is_directory: false,
                 is_symlink: false,
+                is_file: true,
                 owner_id: inode.uid as u64,
                 group_id: inode.gid as u64,
             }),
@@ -1129,6 +1130,7 @@ impl FileSystem for Ext2Volume {
                     modified_at: inode.atime as u64,
                     is_directory: true,
                     is_symlink: false,
+                    is_file: false,
                     owner_id: inode.uid as u64,
                     group_id: inode.gid as u64,
                 })
@@ -1427,6 +1429,7 @@ impl FileSystem for Ext2Volume {
             modified_at: inode.atime as u64,
             is_directory: false,
             is_symlink: false,
+            is_file: true,
             owner_id: inode.uid as u64,
             group_id: inode.gid as u64,
         })

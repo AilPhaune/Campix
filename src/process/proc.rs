@@ -1,6 +1,6 @@
 use core::mem::offset_of;
 
-use alloc::{string::String, sync::Arc};
+use alloc::{boxed::Box, fmt, format, string::String, sync::Arc, vec::Vec};
 use spin::Mutex;
 
 use crate::{
@@ -15,6 +15,25 @@ use super::{
     task::{get_tss, set_tss},
 };
 
+pub struct ProcessAllocatedCode {
+    pub allocs: Vec<Box<[u8]>>,
+}
+
+impl fmt::Debug for ProcessAllocatedCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProcessAllocatedCode")
+            .field("allocs", &format!("[...] - {} elements", self.allocs.len()))
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProcessAccess {
+    pub euid: u32,
+    pub egid: u32,
+    pub supplementary_gids: Vec<u32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Process {
     pub pid: u32,
@@ -22,8 +41,15 @@ pub struct Process {
     pub cmdline: Arc<String>,
     pub cwd: Arc<Mutex<String>>,
 
+    pub uid: u32,
+    pub gid: u32,
+
+    pub effective_process_access: Arc<Mutex<ProcessAccess>>,
+
     pub page_table: Arc<Mutex<PageTable>>,
     pub heap: Arc<Mutex<ProcessHeap>>,
+
+    pub allocated_code: Arc<Mutex<ProcessAllocatedCode>>,
 }
 
 #[repr(C, packed(8))]

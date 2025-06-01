@@ -2,6 +2,7 @@ use alloc::{
     collections::{BTreeMap, VecDeque},
     string::String,
     sync::Arc,
+    vec::Vec,
 };
 use spin::{mutex::Mutex, RwLock};
 
@@ -12,7 +13,7 @@ use crate::{
 
 use super::{
     memory::{ProcessHeap, ThreadStack, PROC_KERNEL_STACK_TOP, PROC_USER_STACK_TOP},
-    proc::{Process, Thread, ThreadState},
+    proc::{Process, ProcessAccess, ProcessAllocatedCode, Thread, ThreadState},
 };
 
 #[derive(Debug, Clone)]
@@ -102,6 +103,14 @@ impl Scheduler {
             pid,
             page_table: Arc::new(Mutex::new(options.page_table)),
             heap: Arc::new(Mutex::new(ProcessHeap::new())),
+            uid: options.uid,
+            gid: options.gid,
+            effective_process_access: Arc::new(Mutex::new(ProcessAccess {
+                euid: options.uid,
+                egid: options.gid,
+                supplementary_gids: options.supplementary_gids,
+            })),
+            allocated_code: Arc::new(Mutex::new(options.allocated_code)),
         };
 
         let mut pt = process.page_table.lock();
@@ -194,14 +203,21 @@ impl Scheduler {
     }
 }
 
+#[derive(Debug)]
 pub struct CreateProcessOptions {
     pub name: String,
     pub cmdline: String,
     pub cwd: String,
 
+    pub uid: u32,
+    pub gid: u32,
+    pub supplementary_gids: Vec<u32>,
+
     pub page_table: PageTable,
 
     pub main_thread_state: ThreadState,
+
+    pub allocated_code: ProcessAllocatedCode,
 }
 
 pub static SCHEDULER: Scheduler = Scheduler::new();

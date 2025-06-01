@@ -58,6 +58,7 @@ pub enum VfsError {
     InvalidDataStructure,
     DirectoryNotEmpty,
     NameTooLong,
+    ShortRead,
     Done,
     DriverError(Box<dyn core::fmt::Debug>),
 }
@@ -374,6 +375,7 @@ pub struct FileStat {
     pub created_at: u64,
     pub modified_at: u64,
     pub permissions: u64,
+    pub is_file: bool,
     pub is_directory: bool,
     pub is_symlink: bool,
     pub owner_id: u64,
