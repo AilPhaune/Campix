@@ -42,7 +42,7 @@ pub fn get_tss_addr() -> u64 {
 
 #[allow(static_mut_refs)]
 pub fn get_tss() -> TaskStateSegment {
-    let raw = unsafe { (TSS.get_tss_addr() as *mut RawTaskStateSegment).read_unaligned() };
+    let raw = unsafe { core::ptr::read_volatile(TSS.get_tss_addr() as *mut RawTaskStateSegment) };
 
     TaskStateSegment {
         reserved0: raw.reserved0,
@@ -72,6 +72,6 @@ pub fn set_tss(tss: &TaskStateSegment) {
     };
 
     unsafe {
-        (TSS.get_tss_addr() as *mut RawTaskStateSegment).write_unaligned(raw);
+        core::ptr::write_volatile(TSS.get_tss_addr() as *mut RawTaskStateSegment, raw);
     }
 }

@@ -38,8 +38,9 @@ impl BlockGroupDescriptor {
         if bytes.len() < BLOCK_GROUP_DESCRIPTOR_SIZE as usize {
             None
         } else {
-            let raw =
-                unsafe { (bytes.as_ptr() as *const RawBlockGroupDescriptor).read_unaligned() };
+            let raw = unsafe {
+                core::ptr::read_volatile(bytes.as_ptr() as *const RawBlockGroupDescriptor)
+            };
             Some(BlockGroupDescriptor::of(raw))
         }
     }

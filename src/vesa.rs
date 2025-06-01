@@ -62,11 +62,12 @@ impl Iterator for VesaModeIterator {
     type Item = (u16, VesaModeInfoStructure);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mode = unsafe { self.video_mode_ptr.add(self.index).read_unaligned() };
+        let mode = unsafe { core::ptr::read_volatile(self.video_mode_ptr.add(self.index)) };
         if self.index >= self.modes_count || mode == 0xFFFF {
             None
         } else {
-            let mode_info = unsafe { self.modes_info_ptr.add(self.index).read_unaligned() };
+            let mode_info =
+                unsafe { core::ptr::read_volatile(self.modes_info_ptr.add(self.index)) };
             self.index += 1;
             Some((mode, mode_info))
         }
@@ -75,8 +76,9 @@ impl Iterator for VesaModeIterator {
 
 pub fn iter_modes(obsiboot: &ObsiBootKernelParameters) -> VesaModeIterator {
     let vbe_info_block = unsafe {
-        ((obsiboot.vbe_info_block_ptr as u64 + DIRECT_MAPPING_OFFSET) as *const VbeInfoBlock)
-            .read_unaligned()
+        core::ptr::read_volatile(
+            (obsiboot.vbe_info_block_ptr as u64 + DIRECT_MAPPING_OFFSET) as *const VbeInfoBlock,
+        )
     };
 
     let video_mode_ptr = (vbe_info_block.video_mode_ptr[1] as u64 * 16
@@ -96,8 +98,9 @@ pub fn iter_modes(obsiboot: &ObsiBootKernelParameters) -> VesaModeIterator {
 
 pub fn parse_current_mode(obsiboot: &ObsiBootKernelParameters) {
     let vbe_info_block = unsafe {
-        ((obsiboot.vbe_info_block_ptr as u64 + DIRECT_MAPPING_OFFSET) as *const VbeInfoBlock)
-            .read_unaligned()
+        core::ptr::read_volatile(
+            (obsiboot.vbe_info_block_ptr as u64 + DIRECT_MAPPING_OFFSET) as *const VbeInfoBlock,
+        )
     };
 
     let video_mode_ptr = (vbe_info_block.video_mode_ptr[1] as u64 * 16
@@ -108,7 +111,7 @@ pub fn parse_current_mode(obsiboot: &ObsiBootKernelParameters) {
 
     let mut i = 0;
     let selected_mode_idx = loop {
-        let mode = unsafe { video_mode_ptr.add(i).read_unaligned() };
+        let mode = unsafe { core::ptr::read_volatile(video_mode_ptr.add(i)) };
         if mode == 0xFFFF {
             panic!("Vesa mode {} not found !", selected_mode);
         }
@@ -129,11 +132,9 @@ pub fn parse_current_mode(obsiboot: &ObsiBootKernelParameters) {
     }
 
     unsafe {
-        CURRENT_MODE = Some(
-            modes_info_ptr
-                .add(selected_mode_idx as usize)
-                .read_unaligned(),
-        );
+        CURRENT_MODE = Some(core::ptr::read_volatile(
+            modes_info_ptr.add(selected_mode_idx as usize),
+        ));
     }
 }
 

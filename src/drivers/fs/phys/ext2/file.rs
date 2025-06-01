@@ -399,7 +399,7 @@ impl<'a> DirectoryIterator<'a> {
         let idx = self.read_buffer()?;
 
         let mut entry_raw = unsafe {
-            (self.buffer.as_ptr().add(self.idx) as *const DirectoryEntryRaw).read_unaligned()
+            core::ptr::read_volatile(self.buffer.as_ptr().add(self.idx) as *const DirectoryEntryRaw)
         };
 
         let name_len = if self.have_type_field {
@@ -430,8 +430,10 @@ impl<'a> DirectoryIterator<'a> {
         };
 
         unsafe {
-            (self.buffer.as_ptr().add(self.idx) as *mut DirectoryEntryRaw)
-                .write_unaligned(entry_raw)
+            core::ptr::write_volatile(
+                self.buffer.as_ptr().add(self.idx) as *mut DirectoryEntryRaw,
+                entry_raw,
+            );
         };
 
         macro_rules! done {
@@ -462,8 +464,9 @@ impl<'a> DirectoryIterator<'a> {
         self.idx = previous as usize;
         let idx = self.idx % self.volume.block_size as usize;
 
-        let mut prev_entry_raw =
-            unsafe { (self.buffer.as_ptr().add(idx) as *const DirectoryEntryRaw).read_unaligned() };
+        let mut prev_entry_raw = unsafe {
+            core::ptr::read_volatile(self.buffer.as_ptr().add(idx) as *const DirectoryEntryRaw)
+        };
 
         if let Ok(rec_len) =
             u16::try_from(prev_entry_raw.entry_size as usize + entry.rec_len as usize)
@@ -472,8 +475,10 @@ impl<'a> DirectoryIterator<'a> {
         }
 
         unsafe {
-            (self.buffer.as_ptr().add(idx) as *mut DirectoryEntryRaw)
-                .write_unaligned(prev_entry_raw)
+            core::ptr::write_volatile(
+                self.buffer.as_ptr().add(idx) as *mut DirectoryEntryRaw,
+                prev_entry_raw,
+            )
         };
 
         done!();
@@ -512,7 +517,9 @@ impl<'a> DirectoryIterator<'a> {
                 let idx = self.read_buffer()?;
 
                 let mut entry_raw = unsafe {
-                    (self.buffer.as_ptr().add(idx) as *const DirectoryEntryRaw).read_unaligned()
+                    core::ptr::read_volatile(
+                        self.buffer.as_ptr().add(idx) as *const DirectoryEntryRaw
+                    )
                 };
                 entry_raw.inode = inode_i;
                 entry_raw.type_or_len_hi = if self.have_type_field {
@@ -527,8 +534,10 @@ impl<'a> DirectoryIterator<'a> {
                 name_buffer.copy_from_slice(name);
 
                 unsafe {
-                    (self.buffer.as_ptr().add(idx) as *mut DirectoryEntryRaw)
-                        .write_unaligned(entry_raw)
+                    core::ptr::write_volatile(
+                        self.buffer.as_ptr().add(idx) as *mut DirectoryEntryRaw,
+                        entry_raw,
+                    )
                 };
 
                 done!();
@@ -546,21 +555,27 @@ impl<'a> DirectoryIterator<'a> {
                 let idx = self.read_buffer()?;
 
                 let mut old_entry_raw = unsafe {
-                    (self.buffer.as_ptr().add(idx) as *const DirectoryEntryRaw).read_unaligned()
+                    core::ptr::read_volatile(
+                        self.buffer.as_ptr().add(idx) as *const DirectoryEntryRaw
+                    )
                 };
 
                 old_entry_raw.entry_size = entry_intrinsic_size as u16;
 
                 unsafe {
-                    (self.buffer.as_ptr().add(idx) as *mut DirectoryEntryRaw)
-                        .write_unaligned(old_entry_raw)
+                    core::ptr::write_volatile(
+                        self.buffer.as_ptr().add(idx) as *mut DirectoryEntryRaw,
+                        old_entry_raw,
+                    )
                 };
 
                 self.idx += entry_intrinsic_size;
                 let idx = idx + entry_intrinsic_size;
 
                 let mut entry_raw = unsafe {
-                    (self.buffer.as_ptr().add(idx) as *const DirectoryEntryRaw).read_unaligned()
+                    core::ptr::read_volatile(
+                        self.buffer.as_ptr().add(idx) as *const DirectoryEntryRaw
+                    )
                 };
 
                 entry_raw.entry_size = entry_free_size as u16;
@@ -577,8 +592,10 @@ impl<'a> DirectoryIterator<'a> {
                 name_buffer.copy_from_slice(name);
 
                 unsafe {
-                    (self.buffer.as_ptr().add(idx) as *mut DirectoryEntryRaw)
-                        .write_unaligned(entry_raw)
+                    core::ptr::write_volatile(
+                        self.buffer.as_ptr().add(idx) as *mut DirectoryEntryRaw,
+                        entry_raw,
+                    )
                 };
 
                 done!();
@@ -618,7 +635,9 @@ impl<'a> DirectoryIterator<'a> {
         let name_buffer = &mut self.buffer[name_offset..(name_offset + raw_name_len)];
         name_buffer.copy_from_slice(name);
 
-        unsafe { (self.buffer.as_ptr() as *mut DirectoryEntryRaw).write_unaligned(entry_raw) };
+        unsafe {
+            core::ptr::write_volatile(self.buffer.as_ptr() as *mut DirectoryEntryRaw, entry_raw)
+        };
 
         done!();
 
@@ -645,7 +664,9 @@ impl<'a> Iterator for DirectoryIterator<'a> {
             let idx = self.read_buffer().ok()?;
 
             let entry_raw = unsafe {
-                (self.buffer.as_ptr().add(self.idx) as *const DirectoryEntryRaw).read_unaligned()
+                core::ptr::read_volatile(
+                    self.buffer.as_ptr().add(self.idx) as *const DirectoryEntryRaw
+                )
             };
 
             let name_len = if self.have_type_field {

@@ -45,18 +45,20 @@ pub mod percpu;
 pub mod process;
 pub mod vesa;
 
-const PROGRAM: &[u8] = &[
-    0xcd, 0x80, 0x48, 0xbf, 0x2a, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0xbe, 0x1b, 0x00, 0x00,
-    0x00, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xbb, 0x05, 0x00, 0x00, 0x00, 0x48, 0x83, 0xfb, 0x00, 0x74,
-    0x07, 0x48, 0xff, 0xcb, 0xcd, 0x80, 0xeb, 0xf3, 0xeb, 0xfe, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x20,
-    0x57, 0x6f, 0x72, 0x6c, 0x64, 0x20, 0x66, 0x72, 0x6f, 0x6d, 0x20, 0x75, 0x73, 0x65, 0x72, 0x6c,
-    0x61, 0x6e, 0x64, 0x0d, 0x0a,
+const PROGRAM_A: &[u8] = &[
+    0x48, 0xbf, 0x18, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0xbe, 0x01, 0x00, 0x00, 0x00, 0xb8,
+    0x01, 0x00, 0x00, 0x00, 0xcd, 0x80, 0xeb, 0xfc, 0x41,
+];
+
+const PROGRAM_B: &[u8] = &[
+    0x48, 0xbf, 0x18, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0xbe, 0x01, 0x00, 0x00, 0x00, 0xb8,
+    0x01, 0x00, 0x00, 0x00, 0xcd, 0x80, 0xeb, 0xfc, 0x42,
 ];
 
 #[no_mangle]
 pub fn _start(obsiboot_ptr: u64) -> ! {
     let mut obsiboot =
-        unsafe { (obsiboot_ptr as *const ObsiBootKernelParameters).read_unaligned() };
+        unsafe { core::ptr::read_volatile(obsiboot_ptr as *const ObsiBootKernelParameters) };
 
     unsafe {
         println!("Campix Kernel");
@@ -259,18 +261,18 @@ unsafe fn kmain(obsiboot: ObsiBootKernelParameters) -> ! {
     }
     println!();
 
-    let mut memory = calloc_boxed_slice(4096);
-    memory[0..PROGRAM.len()].copy_from_slice(PROGRAM);
+    let mut memory_a = calloc_boxed_slice(4096);
+    memory_a[0..PROGRAM_A.len()].copy_from_slice(PROGRAM_A);
 
-    let mut page_table = PageTable::alloc_new().unwrap();
+    let mut page_table_a = PageTable::alloc_new().unwrap();
 
     // Copies the kernel's 256..512 pml4 entries
-    page_table.map_global_higher_half();
+    page_table_a.map_global_higher_half();
 
     // Process code
-    page_table.map_4kb(
+    page_table_a.map_4kb(
         0x2_000_000,
-        memory.as_ptr() as u64 - DIRECT_MAPPING_OFFSET,
+        memory_a.as_ptr() as u64 - DIRECT_MAPPING_OFFSET,
         PAGE_RW | PAGE_ACCESSED | PAGE_USER | PAGE_PRESENT,
         false,
     );
@@ -279,7 +281,7 @@ unsafe fn kmain(obsiboot: ObsiBootKernelParameters) -> ! {
         name: "sh".to_string(),
         cmdline: "/system/bin/sh".to_string(),
         cwd: "/".to_string(),
-        page_table,
+        page_table: page_table_a,
         main_thread_state: ThreadState {
             gpregs: ThreadGPRegisters {
                 rax: 0,
@@ -308,7 +310,58 @@ unsafe fn kmain(obsiboot: ObsiBootKernelParameters) -> ! {
             gs_base: 0,
         },
     };
-
     SCHEDULER.create_process(opts);
+
+    let mut memory_b = calloc_boxed_slice(4096);
+    memory_b[0..PROGRAM_B.len()].copy_from_slice(PROGRAM_B);
+
+    let mut page_table_b = PageTable::alloc_new().unwrap();
+
+    // Copies the kernel's 256..512 pml4 entries
+    page_table_b.map_global_higher_half();
+
+    // Process code
+    page_table_b.map_4kb(
+        0x2_000_000,
+        memory_b.as_ptr() as u64 - DIRECT_MAPPING_OFFSET,
+        PAGE_RW | PAGE_ACCESSED | PAGE_USER | PAGE_PRESENT,
+        false,
+    );
+
+    let opts = CreateProcessOptions {
+        name: "ls".to_string(),
+        cmdline: "/system/bin/ls".to_string(),
+        cwd: "/".to_string(),
+        page_table: page_table_b,
+        main_thread_state: ThreadState {
+            gpregs: ThreadGPRegisters {
+                rax: 0,
+                rbx: 0,
+                rcx: 0,
+                rdx: 0,
+                rsi: 0,
+                rdi: 0,
+                r8: 0,
+                r9: 0,
+                r10: 0,
+                r11: 0,
+                r12: 0,
+                r13: 0,
+                r14: 0,
+                r15: 0,
+            },
+            rbp: PROC_USER_STACK_TOP,
+            rsp: PROC_USER_STACK_TOP,
+            rip: 0x2_000_000,
+            rflags: RFlags::empty()
+                .set(RFlag::InterruptFlag)
+                .set(RFlag::IOPL3)
+                .get(),
+            fs_base: 0,
+            gs_base: 0,
+        },
+    };
+    SCHEDULER.create_process(opts);
+
     SCHEDULER.schedule();
 }

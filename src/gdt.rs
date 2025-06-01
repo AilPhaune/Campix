@@ -279,10 +279,10 @@ pub(crate) unsafe fn init_gdtr() {
     };
 
     unsafe {
-        (&GDT.1 as *const TssEntry as *mut TssEntry).write(TssEntry::new(
-            get_tss_addr(),
-            size_of::<RawTaskStateSegment>() as u32 - 1,
-        ));
+        core::ptr::write_volatile(
+            addr_of!(GDT.1) as *mut TssEntry,
+            TssEntry::new(get_tss_addr(), size_of::<RawTaskStateSegment>() as u32 - 1),
+        );
     }
 
     println!("Kernel GDT at {:#016x}", GDT.0.as_ptr() as u64);

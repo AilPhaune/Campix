@@ -1,4 +1,6 @@
-use alloc::{boxed::Box, vec::Vec};
+use core::fmt::Debug;
+
+use alloc::{boxed::Box, fmt, vec::Vec};
 
 use crate::{
     data::calloc_boxed_slice,
@@ -102,12 +104,20 @@ impl ProcessHeap {
     }
 }
 
-#[derive(Debug)]
 pub struct ThreadStack {
     pub stack_top: u64,
     pub stack_size: u64,
 
     pub stack_buffers: Vec<Box<[u8]>>,
+}
+
+impl Debug for ThreadStack {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ThreadStack")
+            .field("stack_top", &self.stack_top)
+            .field("stack_size", &self.stack_size)
+            .finish()
+    }
 }
 
 impl ThreadStack {

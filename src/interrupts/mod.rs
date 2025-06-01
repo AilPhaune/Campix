@@ -18,3 +18,14 @@ pub fn init() {
         asm!("sti");
     }
 }
+
+pub fn run_without_interrupts<F>(f: F)
+where
+    F: FnOnce(),
+{
+    unsafe {
+        asm!("cli");
+        f();
+        asm!("sti");
+    }
+}

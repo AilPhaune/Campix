@@ -135,7 +135,7 @@ impl Superblock {
         let mut data = [0u8; 1024];
         device.seek(SeekPosition::FromStart(1024))?;
         device.read(&mut data)?;
-        Ok(unsafe { (data.as_ptr() as *const Superblock).read_unaligned() })
+        Ok(unsafe { core::ptr::read_volatile(data.as_ptr() as *const Superblock) })
     }
 
     pub fn get_ro_features(&self) -> ROFeatures {

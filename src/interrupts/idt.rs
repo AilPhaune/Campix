@@ -83,6 +83,41 @@ static mut IDT: Idt = Idt {
     entries: [IdtEntry64::missing(); 256],
 };
 
+#[repr(C, packed)]
+#[derive(Debug, Clone)]
+struct IdtDescriptor {
+    limit: u16,
+    base: u64,
+}
+
+#[repr(C, align(16))]
+struct AlignedIdtDescriptor([IdtDescriptor; 1]);
+
+impl AlignedIdtDescriptor {
+    const fn new() -> Self {
+        Self([IdtDescriptor { limit: 0, base: 0 }])
+    }
+}
+
+static mut IDT_DESCRIPTOR: AlignedIdtDescriptor = AlignedIdtDescriptor::new();
+
+#[allow(static_mut_refs)]
+unsafe fn load_idt(idt: &Idt) {
+    let descriptor = IdtDescriptor {
+        limit: (core::mem::size_of::<Idt>() - 1) as u16,
+        base: idt as *const _ as u64,
+    };
+    println!("Loading IDT.");
+    println!("IDT Descriptor: {:#?}", descriptor);
+    println!("IDT Descriptor Address: {:?}", IDT_DESCRIPTOR.0.as_ptr());
+    core::ptr::write_volatile(IDT_DESCRIPTOR.0.as_ptr() as *mut IdtDescriptor, descriptor);
+    asm!(
+        "lidt [{}]",
+        in(reg) IDT_DESCRIPTOR.0.as_ptr(),
+        options(readonly, nostack, preserves_flags)
+    );
+}
+
 fn unhandled_interrupt(
     int: u64,
     _rsp: u64,
@@ -106,24 +141,6 @@ pub type HandlerFnType = fn(
 );
 
 static mut HANDLERS: [HandlerFnType; 256] = [unhandled_interrupt; 256];
-
-#[repr(C, packed)]
-struct IdtDescriptor {
-    limit: u16,
-    base: u64,
-}
-
-unsafe fn load_idt(idt: &Idt) {
-    let descriptor = IdtDescriptor {
-        limit: (core::mem::size_of::<Idt>() - 1) as u16,
-        base: idt as *const _ as u64,
-    };
-    asm!(
-        "lidt [{}]",
-        in(reg) &descriptor,
-        options(readonly, nostack, preserves_flags)
-    );
-}
 
 extern "C" {
     static isr_stub_table: [extern "C" fn(); 256];

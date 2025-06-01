@@ -335,7 +335,9 @@ impl Ext2Volume {
         self.read_block((block + block_index) as u64, &mut buffer)?;
 
         let raw = unsafe {
-            (buffer.as_ptr().add(offset_in_block as usize) as *const RawInode).read_unaligned()
+            core::ptr::read_volatile(
+                buffer.as_ptr().add(offset_in_block as usize) as *const RawInode
+            )
         };
 
         Ok(Inode::from_raw(raw, inode, parent_inode))
@@ -363,8 +365,10 @@ impl Ext2Volume {
         let mut buffer = alloc::vec![0u8; self.block_size as usize];
         self.read_block((block + block_index) as u64, &mut buffer)?;
         unsafe {
-            (buffer.as_ptr().add(offset_in_block as usize) as *mut RawInode)
-                .write_unaligned(raw_inode)
+            core::ptr::write_volatile(
+                buffer.as_ptr().add(offset_in_block as usize) as *mut RawInode,
+                raw_inode,
+            )
         };
         self.write_block((block + block_index) as u64, &buffer)?;
 
@@ -666,7 +670,7 @@ impl Ext2Volume {
 
         let mut buffer = alloc::vec![0u8; size_of::<Superblock>()];
         unsafe {
-            (buffer.as_mut_ptr() as *mut Superblock).write_unaligned(superblock);
+            core::ptr::write_volatile(buffer.as_mut_ptr() as *mut Superblock, superblock);
         }
 
         self.device.seek(SeekPosition::FromStart(1024))?;
@@ -704,8 +708,10 @@ impl Ext2Volume {
                     + 2; // Because superblock is at +1
 
                 self.read_block(backup, &mut buffer)?;
-                (buffer.as_mut_ptr().add(offset_in_block) as *mut RawBlockGroupDescriptor)
-                    .write_unaligned(descriptor.to_raw());
+                core::ptr::write_volatile(
+                    buffer.as_mut_ptr().add(offset_in_block) as *mut RawBlockGroupDescriptor,
+                    descriptor.to_raw(),
+                );
                 self.write_block(backup, &buffer)?;
             }
         }

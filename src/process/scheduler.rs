@@ -7,7 +7,7 @@ use spin::{mutex::Mutex, RwLock};
 
 use crate::{
     paging::{PageTable, PAGE_ACCESSED, PAGE_PRESENT, PAGE_RW, PAGE_USER},
-    percpu::core_id,
+    percpu::{core_id, get_per_cpu},
 };
 
 use super::{
@@ -149,7 +149,22 @@ impl Scheduler {
         }
         loop {
             let mut guard = self.task_queue.lock();
+
             let thread: Option<ProcThreadInfo> = guard.pop_front();
+
+            let per_cpu = get_per_cpu();
+            if let (false, Some(pid), Some(tid)) = (
+                per_cpu.currently_running,
+                per_cpu.runing_pid,
+                per_cpu.running_tid,
+            ) {
+                if let Some(thread) = self.get_thread(tid) {
+                    if thread.pid == pid {
+                        guard.push_back(thread);
+                    }
+                }
+            }
+
             drop(guard);
 
             if let Some(thread) = thread {

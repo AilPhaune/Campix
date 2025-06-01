@@ -29,6 +29,8 @@ pub fn handler(
     ifc: &mut InterruptFrameContext,
     ife: Option<&mut InterruptFrameExtra>,
 ) {
+    println!("Page fault.");
+
     unsafe {
         let fault_addr = Cr2::read();
         let space = get_address_space(fault_addr);

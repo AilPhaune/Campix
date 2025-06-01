@@ -189,7 +189,7 @@ pub unsafe fn init_paging(
     // Usable regions
     let memory_layout_ptr = ptr_of_phys(memory_layout_ptr as *mut OsMemoryRegion);
     for i in 0..memory_layout_entries {
-        let region = memory_layout_ptr.add(i as usize).read_unaligned();
+        let region = core::ptr::read_volatile(memory_layout_ptr.add(i as usize));
         if region.usable == 0 || region.start < (1024 * 1024) {
             continue;
         }

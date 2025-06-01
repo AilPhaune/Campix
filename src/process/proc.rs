@@ -8,7 +8,6 @@ use crate::{
     gdt::{USERLAND_CODE64_SELECTOR, USERLAND_DATA64_SELECTOR},
     paging::PageTable,
     percpu::get_per_cpu,
-    println,
 };
 
 use super::{
@@ -94,8 +93,6 @@ impl Thread {
         let kstack = self.kernel_stack.lock();
         tss.rsp0 = kstack.stack_top;
         drop(kstack);
-
-        println!("TSS: {:#?}", tss);
 
         set_tss(&tss);
     }

@@ -165,7 +165,7 @@ pub unsafe fn init(
         memory_layout_entries
     );
     for i in 0..memory_layout_entries {
-        let region = memory_layout_ptr.offset(i as isize).read_unaligned();
+        let region = core::ptr::read_volatile(memory_layout_ptr.offset(i as isize));
         let (s, e, u) = (region.start, region.end, region.usable);
         printf!(
             "REGION: {:016x} --> {:016x} (usable:{})\n",
@@ -180,7 +180,7 @@ pub unsafe fn init(
     printf!("===  END MEMORY LAYOUT DUMP  ===\n\n");
 
     for i in 0..memory_layout_entries {
-        let region = memory_layout_ptr.offset(i as isize).read_unaligned();
+        let region = core::ptr::read_volatile(memory_layout_ptr.offset(i as isize));
         let (s, e, u) = (region.start, region.end, region.usable);
         if u == 0 || s < 0x10000 || e < 0x10000 {
             continue;

@@ -98,7 +98,7 @@ impl GUIDPartitionTable {
 
         let mut data = alloc::vec![0u8; 2 * sector_size as usize];
         device.read_chars(0, &mut data).ok()?;
-        let mbr = unsafe { (data.as_ptr() as *const MasterBootRecord).read_unaligned() };
+        let mbr = unsafe { core::ptr::read_volatile(data.as_ptr() as *const MasterBootRecord) };
 
         if mbr.signature[0] != 0x55 || mbr.signature[1] != 0xAA {
             return None;
@@ -126,7 +126,7 @@ impl GUIDPartitionTable {
         }
 
         let header = unsafe {
-            (data.as_ptr().add(sector_size as usize) as *const GPTHeader).read_unaligned()
+            core::ptr::read_volatile(data.as_ptr().add(sector_size as usize) as *const GPTHeader)
         };
         drop(data);
 
@@ -151,7 +151,9 @@ impl GUIDPartitionTable {
         for i in 0..part_count {
             let offset = i * entry_size;
             let entry = unsafe {
-                (data.as_ptr().add(offset) as *const GUIDPartitionTableEntryRaw).read_unaligned()
+                core::ptr::read_volatile(
+                    data.as_ptr().add(offset) as *const GUIDPartitionTableEntryRaw
+                )
             };
             if entry.type_guid == [0; 16] {
                 continue;
