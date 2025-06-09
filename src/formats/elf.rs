@@ -12,14 +12,14 @@ use crate::{
     drivers::vfs::{SeekPosition, VfsError},
     memory::buddy_alloc::PAGE_SIZE,
     paging::{
-        align_down, align_up, PageTable, DIRECT_MAPPING_OFFSET, PAGE_ACCESSED, PAGE_NO_EXECUTE,
-        PAGE_PRESENT, PAGE_RW, PAGE_USER,
+        align_down, align_up, PageTable, DIRECT_MAPPING_OFFSET, PAGE_ACCESSED, PAGE_PRESENT,
+        PAGE_RW, PAGE_USER,
     },
     process::{
         executable::ExecutableFileFormat,
         memory::PROC_USER_STACK_TOP,
         proc::{ProcessAllocatedCode, ThreadGPRegisters, ThreadState},
-        scheduler::CreateProcessOptions,
+        scheduler::{CreateProcessOptions, ProcessSyscallABI},
     },
 };
 
@@ -473,10 +473,13 @@ impl ExecutableFileFormat for Elf64File {
             for virt in (begin_map..end_map).step_by(PAGE_SIZE as usize) {
                 let mut buffer = alloc_boxed_slice(PAGE_SIZE as usize);
                 if virt < ph.p_vaddr {
-                    let zeros = (ph.p_offset - virt) as usize;
-                    let rem = filesz - (ph.p_offset - ph.p_vaddr) as usize;
+                    let zeros = (ph.p_vaddr - virt) as usize;
+                    let rem = (PAGE_SIZE as usize - zeros).min(filesz - code_i);
                     buffer[0..zeros].fill(0);
-                    buffer[zeros..].copy_from_slice(&segment_data[code_i..rem]);
+                    if zeros + rem < PAGE_SIZE as usize {
+                        buffer[zeros + rem..].fill(0);
+                    }
+                    buffer[zeros..zeros + rem].copy_from_slice(&segment_data[code_i..code_i + rem]);
                     code_i += rem;
                 } else if virt + PAGE_SIZE >= end_code {
                     let rem = filesz - code_i;
@@ -485,23 +488,21 @@ impl ExecutableFileFormat for Elf64File {
                     buffer[rem..].fill(0);
                 } else if code_i >= filesz {
                     buffer.fill(0);
+                    code_i += PAGE_SIZE as usize;
                 } else {
                     let rem = filesz - code_i;
                     buffer[0..rem].copy_from_slice(&segment_data[code_i..]);
                     code_i += rem;
                 }
 
-                let mut flags = PAGE_USER | PAGE_ACCESSED | PAGE_RW | PAGE_PRESENT;
-                if !ph.flags.has(ElfProgramHeaderFlag::Executable) {
-                    flags |= PAGE_NO_EXECUTE;
-                }
+                let flags = PAGE_USER | PAGE_ACCESSED | PAGE_RW | PAGE_PRESENT;
 
                 let phys = buffer.as_ptr() as u64 - DIRECT_MAPPING_OFFSET;
                 unsafe {
                     pt.map_4kb(virt, phys, flags, false);
                 }
 
-                allocated_code.push(buffer);
+                allocated_code.push((virt, buffer));
             }
         }
 
@@ -543,6 +544,7 @@ impl ExecutableFileFormat for Elf64File {
             allocated_code: ProcessAllocatedCode {
                 allocs: allocated_code,
             },
+            syscalls: ProcessSyscallABI::Linux,
         })
     }
 }

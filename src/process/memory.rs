@@ -102,6 +102,8 @@ impl ProcessHeap {
     pub fn new() -> Self {
         ProcessHeap {}
     }
+
+    pub fn free(&mut self, _pt: &mut PageTable) {}
 }
 
 pub struct ThreadStack {
@@ -157,5 +159,14 @@ impl ThreadStack {
         unsafe { table.map_4kb(proc_virt, phys, flags, true) };
 
         self.stack_buffers.push(new_buffer);
+    }
+
+    pub fn free(&mut self, table: &mut PageTable) {
+        let bottom = self.get_bottom();
+        for page in (bottom..self.stack_top).step_by(PAGE_SIZE) {
+            unsafe { table.unmap_4kb(page, true) };
+        }
+        self.stack_size = 0;
+        self.stack_buffers.clear();
     }
 }

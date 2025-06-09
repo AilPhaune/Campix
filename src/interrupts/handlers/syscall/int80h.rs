@@ -1,8 +1,11 @@
 use crate::{
-    e9::write_char,
-    interrupts::idt::{InterruptFrameContext, InterruptFrameExtra, InterruptFrameRegisters},
+    interrupts::{
+        handlers::syscall::linux::linux_syscall,
+        idt::{InterruptFrameContext, InterruptFrameExtra, InterruptFrameRegisters},
+    },
+    percpu::get_per_cpu,
     println,
-    process::memory::{get_address_space, VirtualAddressSpace},
+    process::scheduler::{ProcessSyscallABI, SCHEDULER},
 };
 
 pub fn handler(
@@ -10,54 +13,51 @@ pub fn handler(
     rsp: u64,
     ifr: &mut InterruptFrameRegisters,
     ifc: &mut InterruptFrameContext,
-    ife: Option<&mut InterruptFrameExtra>,
+    mut ife: Option<&mut InterruptFrameExtra>,
 ) {
+    let per_cpu = get_per_cpu();
+
     macro_rules! print_info {
         () => {
             println!("Software interrupt 0x80.");
             println!("ist={:#02x}, rsp={:#016x}", ist, rsp);
+            println!("{:#?}", per_cpu);
             println!("{:#?}", ifr);
             println!("{:#?}", ifc);
             println!("{:#?}", ife);
         };
     }
 
-    if ifr.rax == 1 {
-        // print function
+    if let (Some(_), Some(tid), None | Some(true)) = (
+        per_cpu.running_pid,
+        per_cpu.running_tid,
+        per_cpu.interrupted_from_userland.last(),
+    ) {
+        if let Some(mut thread) = SCHEDULER.get_thread(tid) {
+            let lock = thread.thread.process.syscalls.lock();
+            let abi: ProcessSyscallABI = *lock;
+            drop(lock);
 
-        let buffer_begin = ifr.rdi;
-        let buffer_len = ifr.rsi;
+            let ok = match &mut ife {
+                Some(ife) => match abi {
+                    ProcessSyscallABI::Linux => linux_syscall(ifr, ifc, Some(ife), &mut thread),
+                },
+                None => match abi {
+                    ProcessSyscallABI::Linux => linux_syscall(ifr, ifc, None, &mut thread),
+                },
+            };
 
-        // verify bounds
-        if buffer_len > 1024 * 1024 {
-            print_info!();
-            println!("Buffer too large.");
-            println!("Software interrupt 0x80 dump complete.");
-            return;
-        }
-
-        let begin_space = get_address_space(buffer_begin);
-        let end_space = get_address_space(buffer_begin + buffer_len);
-        if !matches!(begin_space, Some(VirtualAddressSpace::LowerHalf(_)))
-            || !matches!(end_space, Some(VirtualAddressSpace::LowerHalf(_)))
-        {
-            print_info!();
-            println!("Buffer has parts outside of lower half.");
-            println!("Software interrupt 0x80 dump complete.");
-            return;
-        }
-
-        let mut ptr = buffer_begin as *mut u8;
-        for _ in 0..buffer_len {
-            unsafe {
-                write_char(*ptr);
-                ptr = ptr.offset(1);
+            if ok {
+                return;
+            } else {
+                print_info!();
+                println!("Interrupt 0x80 dump complete.");
+                return;
             }
         }
-
-        return;
     }
 
     print_info!();
-    println!("Software interrupt 0x80 dump complete.");
+    println!("Interrupt 0x80 dump complete.");
+    ifr.rax = 0xFFFF_FFFF_FFFF_FFFFu64;
 }

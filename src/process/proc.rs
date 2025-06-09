@@ -12,11 +12,21 @@ use crate::{
 
 use super::{
     memory::{ProcessHeap, ThreadStack},
+    scheduler::ProcessSyscallABI,
     task::{get_tss, set_tss},
 };
 
 pub struct ProcessAllocatedCode {
-    pub allocs: Vec<Box<[u8]>>,
+    pub allocs: Vec<(u64, Box<[u8]>)>,
+}
+
+impl ProcessAllocatedCode {
+    pub fn free(&mut self, pt: &mut PageTable) {
+        for alloc in self.allocs.iter() {
+            unsafe { pt.unmap_4kb(alloc.0, true) };
+        }
+        self.allocs.clear();
+    }
 }
 
 impl fmt::Debug for ProcessAllocatedCode {
@@ -34,6 +44,15 @@ pub struct ProcessAccess {
     pub supplementary_gids: Vec<u32>,
 }
 
+#[derive(Debug)]
+pub enum TaskState {
+    Init,
+    Running,
+    Paused,
+    Zombie { exit_code: u64 },
+    Dead,
+}
+
 #[derive(Debug, Clone)]
 pub struct Process {
     pub pid: u32,
@@ -49,7 +68,13 @@ pub struct Process {
     pub page_table: Arc<Mutex<PageTable>>,
     pub heap: Arc<Mutex<ProcessHeap>>,
 
+    pub threads: Arc<Mutex<Vec<Thread>>>,
+    pub zombie_threads: Arc<Mutex<Vec<Thread>>>,
+
     pub allocated_code: Arc<Mutex<ProcessAllocatedCode>>,
+    pub syscalls: Arc<Mutex<ProcessSyscallABI>>,
+
+    pub state: Arc<Mutex<TaskState>>,
 }
 
 #[repr(C, packed(8))]
@@ -97,6 +122,8 @@ pub struct Thread {
     pub state: Arc<Mutex<ThreadState>>,
 
     pub running_cpu: Arc<Mutex<Option<u8>>>,
+
+    pub task_state: Arc<Mutex<TaskState>>,
 }
 
 impl Thread {
@@ -113,7 +140,7 @@ impl Thread {
         drop(guard);
     }
 
-    fn setup_tss_for_thread(&self) {
+    fn setup_tss_for_thread(&self) -> u64 {
         let mut tss = get_tss();
 
         let kstack = self.kernel_stack.lock();
@@ -121,6 +148,8 @@ impl Thread {
         drop(kstack);
 
         set_tss(&tss);
+
+        tss.rsp0
     }
 
     pub fn jmp_to_userland(&self) -> ! {
@@ -131,8 +160,9 @@ impl Thread {
         self.setup_tss_for_thread();
 
         let per_cpu = get_per_cpu();
-        per_cpu.runing_pid = Some(self.pid);
+        per_cpu.running_pid = Some(self.pid);
         per_cpu.running_tid = Some(self.tid);
+        per_cpu.interrupted_from_userland.clear();
 
         let state = self.state.lock();
 

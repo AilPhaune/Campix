@@ -4,6 +4,7 @@ use core::{alloc::Layout, arch::asm};
 use alloc::alloc::{alloc, dealloc};
 use spin::mutex::Mutex;
 
+use crate::data::assign_once::AssignOnce;
 use crate::data::regs::cr::Cr3;
 use crate::{memory::mem::OsMemoryRegion, println};
 
@@ -82,6 +83,8 @@ static mut KERNEL_PAGE_TABLE: Mutex<PageTable> = Mutex::new(PageTable::new_with_
     (&mut ALLOCATOR) as *mut dyn PageAllocator
 }));
 
+static KERNEL_STACK_POINTER: AssignOnce<u64> = AssignOnce::new();
+
 #[allow(static_mut_refs)]
 pub fn get_kernel_page_table() -> &'static Mutex<PageTable> {
     unsafe { &KERNEL_PAGE_TABLE }
@@ -159,6 +162,7 @@ pub unsafe fn init_paging(
     pml4_ptr_phys: u64,
     page_alloc_curr: u64,
     page_alloc_end: u64,
+    kernel_stack_pointer: u64,
 ) {
     let free_page_count = (page_alloc_end - page_alloc_curr) / 4096;
     if free_page_count == 0 {
@@ -219,6 +223,7 @@ pub unsafe fn init_paging(
 
     alloc.load();
 
+    KERNEL_STACK_POINTER.set(kernel_stack_pointer);
     KERNEL_PAGE_TABLE = Mutex::new(alloc);
 }
 
@@ -667,15 +672,40 @@ impl PageTable {
         }
     }
 
+    pub fn unmap_global_higher_half(&mut self) {
+        unsafe {
+            let pml4 = &mut *((self.pml4_phys + DIRECT_MAPPING_OFFSET) as *mut Table);
+
+            // 0xFFFF_8000_0000_0000 - 0xFFFF_9000_0000_0000 (Kernel code)
+            pml4.0[256..288].fill(0);
+
+            // 0xFFFF_9000_0000_0000 - 0xFFFF_A000_0000_0000 (Kernel stack)
+            pml4.0[288..320].fill(0);
+
+            // 0xFFFF_A000_0000_0000 - 0xFFFF_B000_0000_0000 (Direct mapping)
+            pml4.0[320..352].fill(0);
+
+            // 0xFFFF_B000_0000_0000 - 0xFFFF_C000_0000_0000 (MMIO)
+            pml4.0[352..384].fill(0);
+        }
+    }
+
     pub fn translate(&mut self, virt: u64) -> Option<u64> {
         unsafe {
             let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = split_virt_addr(virt);
+            println!(
+                "Translating virt: {:#x}. PML4 idx: {}, PDPT idx: {}, PD idx: {}, PT idx: {}",
+                virt, pml4_idx, pdpt_idx, pd_idx, pt_idx
+            );
 
             let allocator = &mut *self.allocator;
 
             let pml4: &mut Table = &mut *((self.pml4_phys + DIRECT_MAPPING_OFFSET) as *mut Table);
+            println!("pml4[{}] = {:#x}", pml4_idx, pml4.0[pml4_idx]);
             let pdpt = pml4.get_table::<false>(pml4_idx, allocator, 0, 0)?;
+            println!("pdpt[{}] = {:#x}", pdpt_idx, pdpt.0[pdpt_idx]);
             let pd = pdpt.get_table::<false>(pdpt_idx, allocator, 0, 0)?;
+            println!("pd[{}] = {:#x}", pd_idx, pd.0[pd_idx]);
 
             let pd_entry = *pd.get_entry(pd_idx);
             if (pd_entry & PAGE_PRESENT) == PAGE_PRESENT && (pd_entry & PAGE_HUGE) == PAGE_HUGE {
@@ -683,6 +713,7 @@ impl PageTable {
             }
 
             let pt = pd.get_table::<false>(pd_idx, allocator, 0, PAGE_HUGE)?;
+            println!("pt[{}] = {:#x}", pt_idx, pt.0[pt_idx]);
             let pt_entry = *pt.get_entry(pt_idx);
             if (pt_entry & PAGE_PRESENT) == PAGE_PRESENT {
                 return Some((pt_entry & 0x000F_FFFF_FFFF_F000) + (virt % PAGE_SIZE as u64));
@@ -703,6 +734,31 @@ impl PageTable {
 impl Drop for PageTable {
     fn drop(&mut self) {
         unsafe {
+            if self.pml4_phys == 0 {
+                return;
+            }
+            if Cr3::read() == self.pml4_phys {
+                panic!("Dropping active page table");
+            }
+
+            let self_ptr = self as *mut PageTable;
+
+            self.unmap_global_higher_half();
+            for PageTableEntry {
+                virt, page_size, ..
+            } in self.iter_range(0, 0xFFFF_FFFF_FFFF_FFFF)
+            {
+                match page_size {
+                    PageSize::Kb4 => (*self_ptr)
+                        .unmap_4kb(virt, false)
+                        .expect("Failed to unmap 4kb page"),
+                    PageSize::Mb2 => (*self_ptr)
+                        .unmap_2mb(virt, false)
+                        .expect("Failed to unmap 2mb page"),
+                    PageSize::Gb1 => unreachable!(),
+                }
+            }
+
             if self.allocator_owns_pml4 {
                 (*self.allocator).free_page((self.pml4_phys + DIRECT_MAPPING_OFFSET) as *mut u8);
             }
@@ -737,5 +793,28 @@ impl PageAllocator for KernelPageTablesAllocator {
     fn free_page(&mut self, page: *mut u8) {
         let layout = Layout::from_size_align(4096, 4096).unwrap();
         unsafe { dealloc(page as u64 as *mut u8, layout) };
+    }
+}
+
+pub fn run_on_global_kernel_stack<F>(f: F) -> !
+where
+    F: FnOnce(),
+{
+    unsafe {
+        let kpt = get_kernel_page_table().lock();
+        let cr3 = kpt.pml4_phys;
+        let rsp = KERNEL_STACK_POINTER.get().unwrap();
+        drop(kpt);
+
+        core::arch::asm!(
+            "mov rsp, {rsp}",
+            "mov cr3, {cr3}",
+            "push {f}",
+            "ret",
+            rsp = in(reg) rsp,
+            cr3 = in(reg) cr3,
+            f = in(reg) &f,
+            options(noreturn)
+        );
     }
 }

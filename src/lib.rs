@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![feature(unsafe_cell_access)]
 
 use core::num::NonZeroUsize;
 
@@ -60,6 +61,7 @@ pub fn _start(obsiboot_ptr: u64) -> ! {
             obsiboot.pml4_base_address as u64,
             obsiboot.page_tables_page_allocator_current_free_page as u64,
             obsiboot.page_tables_page_allocator_last_usable_page as u64,
+            obsiboot.kernel_stack_pointer,
         );
         println!("Paging initialized");
 

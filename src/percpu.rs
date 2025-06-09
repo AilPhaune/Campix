@@ -1,13 +1,15 @@
 use core::mem::offset_of;
 
+use alloc::vec::Vec;
+
 use crate::data::regs::fs_gs_base::{GsBase, KernelGsBase};
 
 #[derive(Default, Debug, Clone)]
 pub struct PerCpu {
     pub exists: bool,
     pub core_id: u8,
-    pub currently_running: bool,
-    pub runing_pid: Option<u32>,
+    pub interrupted_from_userland: Vec<bool>,
+    pub running_pid: Option<u32>,
     pub running_tid: Option<u32>,
 }
 
@@ -16,8 +18,8 @@ impl PerCpu {
         PerCpu {
             exists: false,
             core_id: 0,
-            currently_running: false,
-            runing_pid: None,
+            interrupted_from_userland: Vec::new(),
+            running_pid: None,
             running_tid: None,
         }
     }
@@ -30,8 +32,8 @@ pub fn init_per_cpu(core_id: u8) {
         PER_CPU[core_id as usize] = PerCpu {
             exists: true,
             core_id,
-            currently_running: false,
-            runing_pid: None,
+            interrupted_from_userland: Vec::new(),
+            running_pid: None,
             running_tid: None,
         };
 

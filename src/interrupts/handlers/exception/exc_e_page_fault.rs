@@ -1,5 +1,5 @@
 use crate::{
-    data::regs::cr::Cr2,
+    data::regs::cr::{Cr2, Cr3},
     interrupts::idt::{InterruptFrameContext, InterruptFrameExtra, InterruptFrameRegisters},
     paging::{PAGE_ACCESSED, PAGE_PRESENT, PAGE_RW, PAGE_SIZE, PAGE_USER},
     percpu::get_per_cpu,
@@ -29,16 +29,19 @@ pub fn handler(
     ifc: &mut InterruptFrameContext,
     ife: Option<&mut InterruptFrameExtra>,
 ) {
-    println!("Page fault.");
-
     unsafe {
         let fault_addr = Cr2::read();
+        let cr3 = Cr3::read();
+
         let space = get_address_space(fault_addr);
         let per_cpu = get_per_cpu();
+
+        let is_process_fault = ifc.cs & 0b11 != 0;
 
         macro_rules! print_info0 {
             () => {
                 println!("Page fault addr={:#016x} in {:?}", fault_addr, space);
+                println!("cr3 = {:#016x}", cr3);
                 println!("rsp = {:#016x}", rsp);
                 println!("{:#?}", ifr);
                 println!("{:#?}", ifc);
@@ -92,14 +95,6 @@ pub fn handler(
             };
         }
 
-        if ifc.exception_error_code & CODE_RESERVED_WRITE != 0
-            || ifc.exception_error_code & CODE_PROTECTION_KEY != 0
-            || ifc.exception_error_code & CODE_SGX != 0
-        {
-            print_info1!();
-            panic!("Unrecoverable page fault...");
-        }
-
         let Some(thread) = SCHEDULER.get_thread(tid) else {
             print_info1!();
             println!("Running thread not found in scheduler");
@@ -111,6 +106,19 @@ pub fn handler(
                 print_info1!();
                 println!("Running process id: {}", thread.pid);
             };
+        }
+
+        if ifc.exception_error_code & CODE_RESERVED_WRITE != 0
+            || ifc.exception_error_code & CODE_PROTECTION_KEY != 0
+            || ifc.exception_error_code & CODE_SGX != 0
+        {
+            print_info2!();
+            if is_process_fault {
+                println!("Segmentation fault");
+                SCHEDULER.kill_process(thread.pid);
+                SCHEDULER.schedule()
+            }
+            panic!("Unrecoverable page fault...");
         }
 
         let tsettings = SCHEDULER.get_thread_settings();
@@ -180,6 +188,11 @@ pub fn handler(
         }
 
         print_info2!();
+        if is_process_fault {
+            println!("Segmentation fault");
+            SCHEDULER.kill_process(thread.pid);
+            SCHEDULER.schedule()
+        }
         panic!("Page fault addr={:#016x} in {:?}", fault_addr, space);
     }
 }

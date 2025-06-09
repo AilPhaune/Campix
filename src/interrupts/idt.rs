@@ -372,6 +372,7 @@ fn common_exit_interrupt(
     _ife: Option<&mut InterruptFrameExtra>,
 ) {
     let per_cpu = get_per_cpu();
+    per_cpu.interrupted_from_userland.pop();
 
     if ifc.cs & 0b11 != 0 {
         // If the interrupt comes from lower privilege level, we need to lock back the thread
@@ -395,6 +396,8 @@ fn common_enter_interrupt(
     let per_cpu = get_per_cpu();
 
     let (ifr, ifc, ife) = unsafe { get_interrupt_context(rsp) };
+
+    per_cpu.interrupted_from_userland.push(ifc.cs & 0b11 != 0);
 
     if ifc.cs & 0b11 != 0 {
         if let Some(ife) = &ife {

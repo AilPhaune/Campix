@@ -2,6 +2,7 @@ use core::alloc::Layout;
 
 use alloc::{alloc::alloc, boxed::Box};
 
+pub mod assign_once;
 pub mod bitmap;
 pub mod bitset_enum;
 pub mod either;
