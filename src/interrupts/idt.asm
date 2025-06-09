@@ -125,6 +125,7 @@ isr_stub_%+%1:
 extern idt_exception_handler
 extern idt_irq_handler
 extern idt_software_interrupt_handler
+extern fast_syscall_handler
 
 isr_no_err_stub 0
 isr_no_err_stub 1

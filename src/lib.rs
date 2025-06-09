@@ -34,6 +34,7 @@ pub mod obsiboot;
 pub mod paging;
 pub mod percpu;
 pub mod process;
+pub mod syscalls;
 pub mod vesa;
 
 #[no_mangle]
@@ -81,6 +82,9 @@ pub fn _start(obsiboot_ptr: u64) -> ! {
 
         interrupts::init();
         println!("Interrupts initialized");
+
+        syscalls::init();
+        println!("Syscalls initialized");
 
         vesa::parse_current_mode(&obsiboot);
         println!("VESA initialized");

@@ -1,6 +1,8 @@
+use core::panic;
+
 use crate::{
     interrupts::{
-        handlers::syscall::linux::linux_syscall,
+        handlers::syscall::linux::{linux_syscall, linux_syscall_fast},
         idt::{InterruptFrameContext, InterruptFrameExtra, InterruptFrameRegisters},
     },
     percpu::get_per_cpu,
@@ -60,4 +62,27 @@ pub fn handler(
     print_info!();
     println!("Interrupt 0x80 dump complete.");
     ifr.rax = 0xFFFF_FFFF_FFFF_FFFFu64;
+}
+
+pub fn handler_fast() {
+    let per_cpu = get_per_cpu();
+
+    if let (Some(_), Some(tid), None | Some(true)) = (
+        per_cpu.running_pid,
+        per_cpu.running_tid,
+        per_cpu.interrupted_from_userland.last(),
+    ) {
+        if let Some(mut thread) = SCHEDULER.get_thread(tid) {
+            let lock = thread.thread.process.syscalls.lock();
+            let abi: ProcessSyscallABI = *lock;
+            drop(lock);
+
+            match abi {
+                ProcessSyscallABI::Linux => linux_syscall_fast(&mut thread),
+            };
+
+            return;
+        }
+    }
+    panic!("Bad interrupt.");
 }

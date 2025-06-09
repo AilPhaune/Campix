@@ -157,11 +157,12 @@ impl Thread {
         let pml4 = pt.get_pml4();
         drop(pt);
 
-        self.setup_tss_for_thread();
+        let kstack = self.setup_tss_for_thread();
 
         let per_cpu = get_per_cpu();
         per_cpu.running_pid = Some(self.pid);
         per_cpu.running_tid = Some(self.tid);
+        per_cpu.kernel_rsp = kstack;
         per_cpu.interrupted_from_userland.clear();
 
         let state = self.state.lock();

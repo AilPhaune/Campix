@@ -1,4 +1,7 @@
-use core::arch::asm;
+use core::{
+    arch::{asm, naked_asm},
+    mem::offset_of,
+};
 
 use alloc::boxed::Box;
 
@@ -7,7 +10,7 @@ use crate::{
     gdt::{KERNEL_CODE_SELECTOR, KERNEL_DATA_SELECTOR},
     interrupts::pic::pic_send_eoi,
     paging::{get_kernel_page_table, DIRECT_MAPPING_OFFSET, PAGE_ACCESSED, PAGE_PRESENT, PAGE_RW},
-    percpu::{core_id, get_per_cpu},
+    percpu::{core_id, get_per_cpu, PerCpu},
     println,
     process::{
         memory::GLOB_KERNEL_STACK_TOP,
@@ -144,6 +147,75 @@ static mut HANDLERS: [HandlerFnType; 256] = [unhandled_interrupt; 256];
 
 extern "C" {
     static isr_stub_table: [extern "C" fn(); 256];
+}
+
+#[no_mangle]
+#[unsafe(naked)]
+/// # Safety
+/// DO NOT CALL
+pub unsafe extern "C" fn fast_syscall_entry() {
+    naked_asm!(
+        "swapgs",
+        "mov gs:[{offset_rax}], rax",
+        "mov gs:[{offset_rbx}], rbx",
+        "mov gs:[{offset_rcx}], rcx",
+        "mov gs:[{offset_rdx}], rdx",
+        "mov gs:[{offset_rdi}], rdi",
+        "mov gs:[{offset_rsi}], rsi",
+        "mov gs:[{offset_rsp}], rsp",
+        "mov gs:[{offset_rbp}], rbp",
+        "mov gs:[{offset_r8}], r8",
+        "mov gs:[{offset_r9}], r9",
+        "mov gs:[{offset_r10}], r10",
+        "mov gs:[{offset_r11}], r11",
+        "mov gs:[{offset_r12}], r12",
+        "mov gs:[{offset_r13}], r13",
+        "mov gs:[{offset_r14}], r14",
+        "mov gs:[{offset_r15}], r15",
+
+        "mov rsp, gs:[{offset_kernel_rsp}]",
+        "call {fn_syscall_handler}",
+
+        "mov rax, gs:[{offset_rax}]",
+        "mov rbx, gs:[{offset_rbx}]",
+        "mov rcx, gs:[{offset_rcx}]",
+        "mov rdx, gs:[{offset_rdx}]",
+        "mov rdi, gs:[{offset_rdi}]",
+        "mov rsi, gs:[{offset_rsi}]",
+        "mov rsp, gs:[{offset_rsp}]",
+        "mov rbp, gs:[{offset_rbp}]",
+        "mov r8, gs:[{offset_r8}]",
+        "mov r9, gs:[{offset_r9}]",
+        "mov r10, gs:[{offset_r10}]",
+        "mov r11, gs:[{offset_r11}]",
+        "mov r12, gs:[{offset_r12}]",
+        "mov r13, gs:[{offset_r13}]",
+        "mov r14, gs:[{offset_r14}]",
+        "mov r15, gs:[{offset_r15}]",
+        "mov rbp, rsp",
+        "swapgs",
+        "sysretq",
+
+        offset_rax = const offset_of!(PerCpu, syscall_data.rax),
+        offset_rbx = const offset_of!(PerCpu, syscall_data.rbx),
+        offset_rcx = const offset_of!(PerCpu, syscall_data.rcx),
+        offset_rdx = const offset_of!(PerCpu, syscall_data.rdx),
+        offset_rdi = const offset_of!(PerCpu, syscall_data.rdi),
+        offset_rsi = const offset_of!(PerCpu, syscall_data.rsi),
+        offset_rsp = const offset_of!(PerCpu, syscall_data.rsp),
+        offset_rbp = const offset_of!(PerCpu, syscall_data.rbp),
+        offset_r8 = const offset_of!(PerCpu, syscall_data.r8),
+        offset_r9 = const offset_of!(PerCpu, syscall_data.r9),
+        offset_r10 = const offset_of!(PerCpu, syscall_data.r10),
+        offset_r11 = const offset_of!(PerCpu, syscall_data.r11),
+        offset_r12 = const offset_of!(PerCpu, syscall_data.r12),
+        offset_r13 = const offset_of!(PerCpu, syscall_data.r13),
+        offset_r14 = const offset_of!(PerCpu, syscall_data.r14),
+        offset_r15 = const offset_of!(PerCpu, syscall_data.r15),
+
+        offset_kernel_rsp = const offset_of!(PerCpu, kernel_rsp),
+        fn_syscall_handler = sym handlers::syscall::int80h::handler_fast,
+    );
 }
 
 #[no_mangle]
