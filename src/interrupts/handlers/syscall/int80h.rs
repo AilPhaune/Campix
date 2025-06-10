@@ -5,9 +5,9 @@ use crate::{
         handlers::syscall::linux::{linux_syscall, linux_syscall_fast},
         idt::{InterruptFrameContext, InterruptFrameExtra, InterruptFrameRegisters},
     },
-    percpu::get_per_cpu,
+    percpu::{get_per_cpu, InterruptSource},
     println,
-    process::scheduler::{ProcessSyscallABI, SCHEDULER},
+    process::scheduler::ProcessSyscallABI,
 };
 
 pub fn handler(
@@ -30,32 +30,28 @@ pub fn handler(
         };
     }
 
-    if let (Some(_), Some(tid), None | Some(true)) = (
-        per_cpu.running_pid,
-        per_cpu.running_tid,
-        per_cpu.interrupted_from_userland.last(),
-    ) {
-        if let Some(mut thread) = SCHEDULER.get_thread(tid) {
-            let lock = thread.thread.process.syscalls.lock();
-            let abi: ProcessSyscallABI = *lock;
-            drop(lock);
+    if let (Some(thread), None | Some(InterruptSource::User)) =
+        (&per_cpu.running_thread, per_cpu.interrupt_sources.last())
+    {
+        let lock = thread.thread.process.syscalls.lock();
+        let abi: ProcessSyscallABI = *lock;
+        drop(lock);
 
-            let ok = match &mut ife {
-                Some(ife) => match abi {
-                    ProcessSyscallABI::Linux => linux_syscall(ifr, ifc, Some(ife), &mut thread),
-                },
-                None => match abi {
-                    ProcessSyscallABI::Linux => linux_syscall(ifr, ifc, None, &mut thread),
-                },
-            };
+        let ok = match &mut ife {
+            Some(ife) => match abi {
+                ProcessSyscallABI::Linux => linux_syscall(ifr, ifc, Some(ife), thread),
+            },
+            None => match abi {
+                ProcessSyscallABI::Linux => linux_syscall(ifr, ifc, None, thread),
+            },
+        };
 
-            if ok {
-                return;
-            } else {
-                print_info!();
-                println!("Interrupt 0x80 dump complete.");
-                return;
-            }
+        if ok {
+            return;
+        } else {
+            print_info!();
+            println!("Interrupt 0x80 dump complete.");
+            return;
         }
     }
 
@@ -66,23 +62,26 @@ pub fn handler(
 
 pub fn handler_fast() {
     let per_cpu = get_per_cpu();
+    per_cpu.interrupt_sources.push(InterruptSource::Syscall);
 
-    if let (Some(_), Some(tid), None | Some(true)) = (
-        per_cpu.running_pid,
-        per_cpu.running_tid,
-        per_cpu.interrupted_from_userland.last(),
-    ) {
-        if let Some(mut thread) = SCHEDULER.get_thread(tid) {
-            let lock = thread.thread.process.syscalls.lock();
-            let abi: ProcessSyscallABI = *lock;
+    if let Some(thread) = &per_cpu.running_thread {
+        let lock = thread.thread.process.syscalls.lock();
+        let abi: ProcessSyscallABI = *lock;
+        drop(lock);
+
+        unsafe {
+            thread.thread.running_cpu.force_unlock();
+
+            let mut lock = thread.thread.running_cpu.lock();
+            *lock = None;
             drop(lock);
-
-            match abi {
-                ProcessSyscallABI::Linux => linux_syscall_fast(&mut thread),
-            };
-
-            return;
         }
+
+        match abi {
+            ProcessSyscallABI::Linux => linux_syscall_fast(thread),
+        };
+
+        return;
     }
     panic!("Bad interrupt.");
 }

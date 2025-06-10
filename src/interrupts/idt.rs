@@ -10,11 +10,10 @@ use crate::{
     gdt::{KERNEL_CODE_SELECTOR, KERNEL_DATA_SELECTOR},
     interrupts::pic::pic_send_eoi,
     paging::{get_kernel_page_table, DIRECT_MAPPING_OFFSET, PAGE_ACCESSED, PAGE_PRESENT, PAGE_RW},
-    percpu::{core_id, get_per_cpu, PerCpu},
+    percpu::{core_id, get_per_cpu, InterruptSource, PerCpu},
     println,
     process::{
         memory::GLOB_KERNEL_STACK_TOP,
-        scheduler::SCHEDULER,
         task::{get_tss, set_tss},
     },
 };
@@ -444,16 +443,14 @@ fn common_exit_interrupt(
     _ife: Option<&mut InterruptFrameExtra>,
 ) {
     let per_cpu = get_per_cpu();
-    per_cpu.interrupted_from_userland.pop();
+    per_cpu.interrupt_sources.pop();
 
     if ifc.cs & 0b11 != 0 {
         // If the interrupt comes from lower privilege level, we need to lock back the thread
-        if let Some(tid) = per_cpu.running_tid {
-            if let Some(thread) = SCHEDULER.get_thread(tid) {
-                let mut lock = thread.thread.running_cpu.lock();
-                *lock = Some(core_id());
-                core::mem::forget(lock);
-            }
+        if let Some(thread) = &per_cpu.running_thread {
+            let mut lock = thread.thread.running_cpu.lock();
+            *lock = Some(core_id());
+            core::mem::forget(lock);
         }
     }
 }
@@ -469,42 +466,44 @@ fn common_enter_interrupt(
 
     let (ifr, ifc, ife) = unsafe { get_interrupt_context(rsp) };
 
-    per_cpu.interrupted_from_userland.push(ifc.cs & 0b11 != 0);
+    per_cpu.interrupt_sources.push(if ifc.cs & 0b11 == 0 {
+        InterruptSource::Kernel
+    } else {
+        InterruptSource::Syscall
+    });
 
     if ifc.cs & 0b11 != 0 {
         if let Some(ife) = &ife {
             // If the interrupt comes from lower privilege level, we need to unlock the thread as it is not running anymore
 
-            if let Some(tid) = per_cpu.running_tid {
-                if let Some(thread) = SCHEDULER.get_thread(tid) {
-                    unsafe {
-                        let mut lock = thread.thread.state.lock();
-                        lock.rflags = ifc.rflags;
-                        lock.rip = ifc.rip;
-                        lock.rbp = ifr.rbp;
-                        lock.rsp = ife.rsp;
-                        lock.gpregs.rax = ifr.rax;
-                        lock.gpregs.rbx = ifr.rbx;
-                        lock.gpregs.rcx = ifr.rcx;
-                        lock.gpregs.rdx = ifr.rdx;
-                        lock.gpregs.rdi = ifr.rdi;
-                        lock.gpregs.rsi = ifr.rsi;
-                        lock.gpregs.r8 = ifr.r8;
-                        lock.gpregs.r9 = ifr.r9;
-                        lock.gpregs.r10 = ifr.r10;
-                        lock.gpregs.r11 = ifr.r11;
-                        lock.gpregs.r12 = ifr.r12;
-                        lock.gpregs.r13 = ifr.r13;
-                        lock.gpregs.r14 = ifr.r14;
-                        lock.gpregs.r15 = ifr.r15;
-                        drop(lock);
+            if let Some(thread) = &per_cpu.running_thread {
+                unsafe {
+                    let mut lock = thread.thread.state.lock();
+                    lock.rflags = ifc.rflags;
+                    lock.rip = ifc.rip;
+                    lock.rbp = ifr.rbp;
+                    lock.rsp = ife.rsp;
+                    lock.gpregs.rax = ifr.rax;
+                    lock.gpregs.rbx = ifr.rbx;
+                    lock.gpregs.rcx = ifr.rcx;
+                    lock.gpregs.rdx = ifr.rdx;
+                    lock.gpregs.rdi = ifr.rdi;
+                    lock.gpregs.rsi = ifr.rsi;
+                    lock.gpregs.r8 = ifr.r8;
+                    lock.gpregs.r9 = ifr.r9;
+                    lock.gpregs.r10 = ifr.r10;
+                    lock.gpregs.r11 = ifr.r11;
+                    lock.gpregs.r12 = ifr.r12;
+                    lock.gpregs.r13 = ifr.r13;
+                    lock.gpregs.r14 = ifr.r14;
+                    lock.gpregs.r15 = ifr.r15;
+                    drop(lock);
 
-                        thread.thread.running_cpu.force_unlock();
+                    thread.thread.running_cpu.force_unlock();
 
-                        let mut lock = thread.thread.running_cpu.lock();
-                        *lock = None;
-                        drop(lock);
-                    }
+                    let mut lock = thread.thread.running_cpu.lock();
+                    *lock = None;
+                    drop(lock);
                 }
             }
         } else {

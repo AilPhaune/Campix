@@ -8,12 +8,12 @@ use crate::{
     gdt::{USERLAND_CODE64_SELECTOR, USERLAND_DATA64_SELECTOR},
     paging::PageTable,
     percpu::get_per_cpu,
+    process::task::get_tss_ref,
 };
 
 use super::{
     memory::{ProcessHeap, ThreadStack},
     scheduler::ProcessSyscallABI,
-    task::{get_tss, set_tss},
 };
 
 pub struct ProcessAllocatedCode {
@@ -66,10 +66,11 @@ pub struct Process {
     pub effective_process_access: Arc<Mutex<ProcessAccess>>,
 
     pub page_table: Arc<Mutex<PageTable>>,
+    pub pml4: u64,
     pub heap: Arc<Mutex<ProcessHeap>>,
 
-    pub threads: Arc<Mutex<Vec<Thread>>>,
-    pub zombie_threads: Arc<Mutex<Vec<Thread>>>,
+    pub threads: Arc<Mutex<Vec<Arc<Thread>>>>,
+    pub zombie_threads: Arc<Mutex<Vec<Arc<Thread>>>>,
 
     pub allocated_code: Arc<Mutex<ProcessAllocatedCode>>,
     pub syscalls: Arc<Mutex<ProcessSyscallABI>>,
@@ -141,33 +142,28 @@ impl Thread {
     }
 
     fn setup_tss_for_thread(&self) -> u64 {
-        let mut tss = get_tss();
+        let tss = get_tss_ref();
 
         let kstack = self.kernel_stack.lock();
         tss.rsp0 = kstack.stack_top;
         drop(kstack);
 
-        set_tss(&tss);
-
         tss.rsp0
     }
 
     pub fn jmp_to_userland(&self) -> ! {
-        let pt = self.process.page_table.lock();
-        let pml4 = pt.get_pml4();
-        drop(pt);
+        let pml4 = self.process.pml4;
 
         let kstack = self.setup_tss_for_thread();
 
         let per_cpu = get_per_cpu();
-        per_cpu.running_pid = Some(self.pid);
-        per_cpu.running_tid = Some(self.tid);
-        per_cpu.kernel_rsp = kstack;
-        per_cpu.interrupted_from_userland.clear();
 
-        let state = self.state.lock();
+        per_cpu.kernel_rsp = kstack;
+        per_cpu.interrupt_sources.clear();
 
         unsafe {
+            let state = self.state.lock();
+
             let regs_ptr = &state.gpregs as *const _;
 
             core::arch::asm!("swapgs");

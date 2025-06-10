@@ -83,7 +83,7 @@ pub fn handler(
             };
         }
 
-        let Some(tid) = per_cpu.running_tid else {
+        let Some(thread) = &per_cpu.running_thread else {
             print_info0!();
             panic!("Unrecoverable page fault...");
         };
@@ -91,20 +91,7 @@ pub fn handler(
         macro_rules! print_info1 {
             () => {
                 print_info0!();
-                println!("Running thread id: {}", tid);
-            };
-        }
-
-        let Some(thread) = SCHEDULER.get_thread(tid) else {
-            print_info1!();
-            println!("Running thread not found in scheduler");
-            panic!("Unrecoverable page fault...");
-        };
-
-        macro_rules! print_info2 {
-            () => {
-                print_info1!();
-                println!("Running process id: {}", thread.pid);
+                println!("Running process thread: {:?}", thread);
             };
         }
 
@@ -112,10 +99,10 @@ pub fn handler(
             || ifc.exception_error_code & CODE_PROTECTION_KEY != 0
             || ifc.exception_error_code & CODE_SGX != 0
         {
-            print_info2!();
+            print_info1!();
             if is_process_fault {
                 println!("Segmentation fault");
-                SCHEDULER.kill_process(thread.pid);
+                SCHEDULER.kill_process(thread.thread.pid);
                 SCHEDULER.schedule()
             }
             panic!("Unrecoverable page fault...");
@@ -131,7 +118,7 @@ pub fn handler(
                     let npages = n.div_ceil(PAGE_SIZE as u64);
 
                     if npages > tsettings.max_kernel_stack_pages {
-                        print_info2!();
+                        print_info1!();
                         println!(
                             "Kernel stack overflow npages={} max={}",
                             npages, tsettings.max_kernel_stack_pages
@@ -139,7 +126,7 @@ pub fn handler(
                         panic!("Unrecoverable page fault...");
                     }
 
-                    let th = thread.thread;
+                    let th = &thread.thread;
 
                     let mut pt = th.process.page_table.lock();
                     let mut kstack = th.kernel_stack.lock();
@@ -161,7 +148,7 @@ pub fn handler(
                     let npages = n.div_ceil(PAGE_SIZE as u64);
 
                     if npages > tsettings.max_user_stack_pages {
-                        print_info2!();
+                        print_info1!();
                         println!(
                             "User stack overflow npages={} max={}",
                             npages, tsettings.max_user_stack_pages
@@ -169,7 +156,7 @@ pub fn handler(
                         panic!("Unrecoverable page fault...");
                     }
 
-                    let th = thread.thread;
+                    let th = &thread.thread;
 
                     let mut pt = th.process.page_table.lock();
                     let mut stack = th.stack.lock();
@@ -187,10 +174,10 @@ pub fn handler(
             _ => (),
         }
 
-        print_info2!();
+        print_info1!();
         if is_process_fault {
             println!("Segmentation fault");
-            SCHEDULER.kill_process(thread.pid);
+            SCHEDULER.kill_process(thread.thread.pid);
             SCHEDULER.schedule()
         }
         panic!("Page fault addr={:#016x} in {:?}", fault_addr, space);

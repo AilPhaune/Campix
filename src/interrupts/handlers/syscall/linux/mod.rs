@@ -47,7 +47,7 @@ fn linux_syscall0(
     _arg3: u64,
     _arg4: u64,
     _arg5: u64,
-    thread: &mut ProcThreadInfo,
+    thread: &ProcThreadInfo,
 ) -> u64 {
     match intno {
         1 => linux_sys_write(thread, arg0, arg1, arg2),
@@ -61,7 +61,7 @@ pub fn linux_syscall(
     ifr: &mut InterruptFrameRegisters,
     _ifc: &mut InterruptFrameContext,
     _ife: Option<&mut InterruptFrameExtra>,
-    thread: &mut ProcThreadInfo,
+    thread: &ProcThreadInfo,
 ) -> bool {
     let res = linux_syscall0(
         ifr.rax, ifr.rdi, ifr.rsi, ifr.rdx, ifr.r10, ifr.r8, ifr.r9, thread,
@@ -70,7 +70,7 @@ pub fn linux_syscall(
     (res as i64) >= 0
 }
 
-pub fn linux_syscall_fast(thread: &mut ProcThreadInfo) -> bool {
+pub fn linux_syscall_fast(thread: &ProcThreadInfo) -> bool {
     let percpu = get_per_cpu();
 
     let res = linux_syscall0(

@@ -1,8 +1,8 @@
-use core::ops::{Add, AddAssign, Sub, SubAssign};
+use core::cmp::Ordering;
 
-use alloc::vec::Vec;
+use alloc::collections::{btree_map::Entry, BTreeMap};
 
-use crate::println;
+use crate::{debuggable_bitset_enum, println};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum KeyboardEventKind {
@@ -11,126 +11,25 @@ pub enum KeyboardEventKind {
     KeyUp,
 }
 
-/// Represents key modifiers, such as Shift, Control, Alt, Windows, NumLock, CapsLock, ScrollLock, and more
-#[repr(u16)]
-#[derive(Copy, Clone, PartialEq, Eq)]
-pub enum KeyModifiers {
-    None = 0,
-    LeftShift = 1,
-    LeftControl = 2,
-    LeftAlt = 4,
-    Windows = 8,
-    NumLock = 16,
-    CapsLock = 32,
-    ScrollLock = 64,
-    RightShift = 128,
-    RightControl = 256,
-    RightAlt = 512,
-}
-
-impl core::fmt::Debug for KeyModifiers {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        if self.is_empty() {
-            write!(f, "None")
-        } else {
-            let mut modifiers = Vec::new();
-            if self.contains_all(KeyModifiers::LeftShift) {
-                modifiers.push("LeftShift");
-            }
-            if self.contains_all(KeyModifiers::LeftControl) {
-                modifiers.push("LeftControl");
-            }
-            if self.contains_all(KeyModifiers::LeftAlt) {
-                modifiers.push("LeftAlt");
-            }
-            if self.contains_all(KeyModifiers::RightShift) {
-                modifiers.push("RightShift");
-            }
-            if self.contains_all(KeyModifiers::RightControl) {
-                modifiers.push("RightControl");
-            }
-            if self.contains_all(KeyModifiers::RightAlt) {
-                modifiers.push("RightAlt");
-            }
-            write!(f, "{}", modifiers.join("+"))
-        }
-    }
-}
-
-impl KeyModifiers {
-    /// Creates a new KeyModifiers enum from a bitfield
-    pub fn from_bits(bits: u16) -> KeyModifiers {
-        unsafe { core::mem::transmute(bits) }
-    }
-
-    /// Converts the KeyModifiers enum to a bitfield
-    pub fn to_bits(&self) -> u16 {
-        *self as u16
-    }
-
-    /// Checks if no modifiers are pressed
-    pub fn is_empty(&self) -> bool {
-        *self == KeyModifiers::None
-    }
-
-    /// Checks if all modifiers are pressed
-    pub fn contains_all(&self, other: KeyModifiers) -> bool {
-        self.to_bits() & other.to_bits() == other.to_bits()
-    }
-
-    /// Checks if any modifier is pressed
-    pub fn contains_any(&self, other: KeyModifiers) -> bool {
-        self.to_bits() & other.to_bits() != 0
-    }
-
-    /// Checks if any Shift is pressed
-    pub fn has_shift(&self) -> bool {
-        self.contains_any(KeyModifiers::LeftShift + KeyModifiers::RightShift)
-    }
-
-    /// Checks if any Control is pressed
-    pub fn has_control(&self) -> bool {
-        self.contains_any(KeyModifiers::LeftControl + KeyModifiers::RightControl)
-    }
-
-    /// Checks if any Alt is pressed
-    pub fn has_alt(&self) -> bool {
-        self.contains_any(KeyModifiers::LeftAlt + KeyModifiers::RightAlt)
-    }
-}
-
-impl Add<KeyModifiers> for KeyModifiers {
-    type Output = KeyModifiers;
-
-    // stfu clippy
-    #[allow(clippy::suspicious_arithmetic_impl)]
-    fn add(self, rhs: KeyModifiers) -> Self::Output {
-        KeyModifiers::from_bits(self.to_bits() | rhs.to_bits())
-    }
-}
-
-impl AddAssign<KeyModifiers> for KeyModifiers {
-    fn add_assign(&mut self, rhs: KeyModifiers) {
-        *self = *self + rhs;
-    }
-}
-
-impl Sub<KeyModifiers> for KeyModifiers {
-    type Output = KeyModifiers;
-
-    fn sub(self, rhs: KeyModifiers) -> Self::Output {
-        KeyModifiers::from_bits(self.to_bits() & !rhs.to_bits())
-    }
-}
-
-impl SubAssign<KeyModifiers> for KeyModifiers {
-    fn sub_assign(&mut self, rhs: KeyModifiers) {
-        *self = *self - rhs;
-    }
-}
+debuggable_bitset_enum!(
+    u16,
+    pub enum KeyModifier {
+        LeftShift = 1,
+        LeftControl = 2,
+        LeftAlt = 4,
+        Windows = 8,
+        NumLock = 16,
+        CapsLock = 32,
+        ScrollLock = 64,
+        RightShift = 128,
+        RightControl = 256,
+        RightAlt = 512,
+    },
+    KeyModifiers
+);
 
 /// Represents a key on the Multimedia section of the keyboard
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd)]
 pub enum MultimediaKey {
     NextTrack,
     Mute,
@@ -151,7 +50,7 @@ pub enum MultimediaKey {
 }
 
 /// Represents a key on the ACPI section of the keyboard
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd)]
 pub enum AcpiKey {
     Power,
     Sleep,
@@ -159,7 +58,7 @@ pub enum AcpiKey {
 }
 
 /// Represents a key on the keyboard
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd)]
 pub enum Key {
     Escape,
     Character(char),
@@ -200,14 +99,15 @@ impl Key {
     /// Returns the modifier(s) that this key is associated with
     pub fn modifiers(&self) -> KeyModifiers {
         match self {
-            Key::LeftControl => KeyModifiers::LeftControl,
-            Key::RightControl => KeyModifiers::RightControl,
-            Key::LeftShift => KeyModifiers::LeftShift,
-            Key::RightShift => KeyModifiers::RightShift,
-            Key::LeftAlt => KeyModifiers::LeftAlt,
-            Key::RightAlt => KeyModifiers::RightAlt,
-            _ => KeyModifiers::None,
+            Key::LeftControl => KeyModifier::LeftControl,
+            Key::RightControl => KeyModifier::RightControl,
+            Key::LeftShift => KeyModifier::LeftShift,
+            Key::RightShift => KeyModifier::RightShift,
+            Key::LeftAlt => KeyModifier::LeftAlt,
+            Key::RightAlt => KeyModifier::RightAlt,
+            _ => return KeyModifiers::empty(),
         }
+        .into()
     }
 
     /// Returns whether or not this key is associated to a printable character
@@ -244,6 +144,80 @@ pub struct KeyboardEvent {
     pub modifiers: KeyModifiers,
     pub raw_key: Key,
     pub mapped_key: Key,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModifiedKey(Key, KeyModifiers);
+
+impl PartialOrd for ModifiedKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ModifiedKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0
+            .partial_cmp(&other.0)
+            .unwrap_or(Ordering::Equal)
+            .then(self.1.partial_cmp(&other.1).unwrap_or(Ordering::Equal))
+    }
+}
+
+/// Maps a keyboard key to another, depending on the layout
+pub struct KeyboardLayout {
+    mappings: BTreeMap<ModifiedKey, Key>,
+}
+
+impl KeyboardLayout {
+    pub fn default_en_us() -> KeyboardLayout {
+        let mut layout = KeyboardLayout {
+            mappings: BTreeMap::new(),
+        };
+        for letter in "abcdefghijklmnopqrstuvwxyz".chars() {
+            layout.set_map(
+                Key::Character(letter),
+                KeyModifier::LeftShift.into(),
+                Some(Key::Character(letter.to_ascii_uppercase())),
+            );
+            layout.set_map(
+                Key::Character(letter),
+                KeyModifier::RightShift.into(),
+                Some(Key::Character(letter.to_ascii_uppercase())),
+            );
+            layout.set_map(
+                Key::Character(letter),
+                *KeyModifiers::empty()
+                    .set(KeyModifier::LeftShift)
+                    .set(KeyModifier::RightShift),
+                Some(Key::Character(letter.to_ascii_uppercase())),
+            );
+        }
+        layout
+    }
+
+    pub fn map(&self, key: Key, modifiers: KeyModifiers) -> Key {
+        self.mappings
+            .get(&ModifiedKey(key, modifiers))
+            .copied()
+            .unwrap_or(key)
+    }
+
+    pub fn set_map(&mut self, key: Key, modifiers: KeyModifiers, mapped_key: Option<Key>) {
+        match self.mappings.entry(ModifiedKey(key, modifiers)) {
+            Entry::Occupied(mut entry) => match mapped_key {
+                Some(key) => *entry.get_mut() = key,
+                None => {
+                    entry.remove();
+                }
+            },
+            Entry::Vacant(entry) => {
+                if let Some(mapped_key) = mapped_key {
+                    entry.insert(mapped_key);
+                }
+            }
+        }
+    }
 }
 
 /// Handles a keyboard event from the keyboard driver

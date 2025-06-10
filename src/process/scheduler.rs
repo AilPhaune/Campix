@@ -9,7 +9,7 @@ use spin::{mutex::Mutex, RwLock};
 use crate::{
     interrupts::handlers::syscall::linux::SIGKILL,
     paging::{get_kernel_page_table, PageTable, PAGE_ACCESSED, PAGE_PRESENT, PAGE_RW, PAGE_USER},
-    percpu::{core_id, get_per_cpu},
+    percpu::{core_id, get_per_cpu, InterruptSource},
 };
 
 use super::{
@@ -19,7 +19,7 @@ use super::{
 
 #[derive(Debug, Clone)]
 pub struct ProcThreadInfo {
-    pub thread: Thread,
+    pub thread: Arc<Thread>,
     pub pid: u32,
     pub tid: u32,
 }
@@ -96,6 +96,7 @@ impl Scheduler {
         let pid = self.get_next_pid();
 
         let name = Arc::new(options.name);
+        let pml4 = options.page_table.get_pml4();
 
         let process = Process {
             name: name.clone(),
@@ -103,6 +104,7 @@ impl Scheduler {
             cwd: Arc::new(Mutex::new(options.cwd)),
             pid,
             page_table: Arc::new(Mutex::new(options.page_table)),
+            pml4,
             heap: Arc::new(Mutex::new(ProcessHeap::new())),
             uid: options.uid,
             gid: options.gid,
@@ -120,7 +122,7 @@ impl Scheduler {
 
         let mut pt = process.page_table.lock();
 
-        let thread = Thread {
+        let thread = Arc::new(Thread {
             pid,
             tid: pid,
             name,
@@ -140,7 +142,7 @@ impl Scheduler {
             state: Arc::new(Mutex::new(options.main_thread_state)),
             running_cpu: Arc::new(Mutex::new(None)),
             task_state: Arc::new(Mutex::new(TaskState::Init)),
-        };
+        });
 
         drop(pt);
 
@@ -149,7 +151,7 @@ impl Scheduler {
         drop(lock);
 
         let proct = ProcThreadInfo {
-            thread,
+            thread: thread.clone(),
             pid,
             tid: pid,
         };
@@ -181,7 +183,7 @@ impl Scheduler {
 
         let lock = self.threads.write();
         if let Some(t) = lock.get(&tid) {
-            let thread: Thread = t.thread.clone();
+            let thread: Arc<Thread> = t.thread.clone();
             drop(lock);
 
             let mut ptlock = thread.process.page_table.lock();
@@ -296,36 +298,52 @@ impl Scheduler {
         'outer: loop {
             let mut guard = self.task_queue.lock();
 
-            let thread: Option<ProcThreadInfo> = guard.pop_front();
-
             let per_cpu = get_per_cpu();
-            if let (Some(true), Some(pid), Some(tid)) = (
-                per_cpu.interrupted_from_userland.last(),
-                per_cpu.running_pid,
-                per_cpu.running_tid,
-            ) {
-                if let Some(thread) = self.get_thread(tid) {
-                    if thread.pid == pid {
-                        let mut ok = false;
-                        let slock = thread.thread.task_state.lock();
-                        if !matches!(*slock, TaskState::Zombie { .. }) {
-                            let plock = thread.thread.process.state.lock();
-                            if !matches!(*plock, TaskState::Zombie { .. }) {
-                                ok = true;
-                            }
-                            drop(plock);
-                        }
-                        drop(slock);
-                        if ok {
-                            guard.push_back(thread);
-                        }
+            if let (Some(InterruptSource::User | InterruptSource::Syscall), Some(thread)) =
+                (per_cpu.interrupt_sources.last(), &per_cpu.running_thread)
+            {
+                let mut ok = false;
+                let slock = thread.thread.task_state.lock();
+                if !matches!(*slock, TaskState::Zombie { .. }) {
+                    let plock = thread.thread.process.state.lock();
+                    if !matches!(*plock, TaskState::Zombie { .. }) {
+                        ok = true;
                     }
+                    drop(plock);
+                }
+                drop(slock);
+                if ok {
+                    guard.push_back(thread.clone());
                 }
             }
+            let thread: Option<ProcThreadInfo> = guard.pop_front();
             drop(guard);
 
-            per_cpu.running_pid = None;
-            per_cpu.running_tid = None;
+            if let (Some(InterruptSource::Syscall), Some(running)) =
+                (per_cpu.interrupt_sources.last(), &per_cpu.running_thread)
+            {
+                let mut state = running.thread.state.lock();
+
+                state.gpregs.rax = per_cpu.syscall_data.rax;
+                state.gpregs.rbx = per_cpu.syscall_data.rbx;
+                state.gpregs.rdx = per_cpu.syscall_data.rdx;
+                state.gpregs.rsi = per_cpu.syscall_data.rsi;
+                state.gpregs.rdi = per_cpu.syscall_data.rdi;
+                state.gpregs.r8 = per_cpu.syscall_data.r8;
+                state.gpregs.r9 = per_cpu.syscall_data.r9;
+                state.gpregs.r10 = per_cpu.syscall_data.r10;
+                state.gpregs.r12 = per_cpu.syscall_data.r12;
+                state.gpregs.r13 = per_cpu.syscall_data.r13;
+                state.gpregs.r14 = per_cpu.syscall_data.r14;
+                state.gpregs.r15 = per_cpu.syscall_data.r15;
+
+                state.rip = per_cpu.syscall_data.rcx; // Syscall return address
+                state.rsp = per_cpu.syscall_data.rsp; // Syscall process stack
+                state.rbp = per_cpu.syscall_data.rbp; // Syscall process stack base
+                state.rflags = per_cpu.syscall_data.r11; // Syscall rflags
+
+                drop(state);
+            }
 
             if let Some(thread) = thread {
                 let plock = self.processes.read();
@@ -348,7 +366,12 @@ impl Scheduler {
                 // Guard is not dropped here, it will be dropped when an interrupt interrupts this thread
                 core::mem::forget(lock);
 
-                thread.thread.jmp_to_userland();
+                per_cpu.running_thread = Some(thread);
+                if let Some(thread) = &per_cpu.running_thread {
+                    thread.thread.jmp_to_userland();
+                } else {
+                    unreachable!("Running proc is not set");
+                }
             }
 
             // If there are no threads to run, sleep

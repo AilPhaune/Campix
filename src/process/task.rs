@@ -30,14 +30,22 @@ pub struct AlignedTSS([u8; size_of::<RawTaskStateSegment>()]);
 static mut TSS: AlignedTSS = AlignedTSS([0; size_of::<RawTaskStateSegment>()]);
 
 impl AlignedTSS {
+    #[inline(always)]
     pub fn get_tss_addr(&self) -> u64 {
         self.0.as_ptr() as u64
     }
 }
 
 #[allow(static_mut_refs)]
+#[inline(always)]
 pub fn get_tss_addr() -> u64 {
     unsafe { TSS.get_tss_addr() }
+}
+
+#[allow(static_mut_refs)]
+#[inline(always)]
+pub fn get_tss_ref() -> &'static mut RawTaskStateSegment {
+    unsafe { &mut *(TSS.get_tss_addr() as *mut RawTaskStateSegment) }
 }
 
 #[allow(static_mut_refs)]

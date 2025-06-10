@@ -6,14 +6,14 @@ macro_rules! debuggable_bitset_enum {
         )*
     }, $sname: ident) => {
         #[repr($t)]
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd)]
         $vis enum $name {
             $(
                 $variant = $value,
             )*
         }
 
-        #[derive(Clone, Copy, PartialEq, Eq)]
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd)]
         $vis struct $sname($t);
 
         impl core::fmt::Debug for $sname {

@@ -3,11 +3,10 @@ use alloc::vec::Vec;
 use crate::{
     drivers::keyboard::{
         handle_keyboard_event, AcpiKey, Key, KeyModifiers, KeyboardEvent, KeyboardEventKind,
-        MultimediaKey,
+        KeyboardLayout, MultimediaKey,
     },
     interrupts::idt::{InterruptFrameContext, InterruptFrameExtra, InterruptFrameRegisters},
     io::inb,
-    println,
 };
 
 fn read_keyboard_layout_en_us() -> Option<(Key, KeyboardEventKind)> {
@@ -162,211 +161,9 @@ fn read_keyboard_layout_en_us() -> Option<(Key, KeyboardEventKind)> {
     }
 }
 
-fn mappings_azerty(raw_key: Key, modifiers: KeyModifiers) -> Key {
-    let s = modifiers.has_shift();
-    match raw_key {
-        Key::Character(c) => Key::Character(match c {
-            'q' => {
-                if s {
-                    'A'
-                } else {
-                    'a'
-                }
-            }
-            'w' => {
-                if s {
-                    'Z'
-                } else {
-                    'z'
-                }
-            }
-            ';' => {
-                if s {
-                    'M'
-                } else {
-                    'm'
-                }
-            }
-            'z' => {
-                if s {
-                    'W'
-                } else {
-                    'w'
-                }
-            }
-            ']' => {
-                if s {
-                    '£'
-                } else {
-                    '$'
-                }
-            }
-            '\'' => {
-                if s {
-                    '%'
-                } else {
-                    'ù'
-                }
-            }
-            '\\' => {
-                if s {
-                    'µ'
-                } else {
-                    '*'
-                }
-            }
-            'm' => {
-                if s {
-                    '?'
-                } else {
-                    ','
-                }
-            }
-            ',' => {
-                if s {
-                    '.'
-                } else {
-                    ';'
-                }
-            }
-            '.' => {
-                if s {
-                    '/'
-                } else {
-                    ':'
-                }
-            }
-            '/' => {
-                if s {
-                    '§'
-                } else {
-                    '!'
-                }
-            }
-            '1' => {
-                if s {
-                    '1'
-                } else {
-                    '&'
-                }
-            }
-            '2' => {
-                if s {
-                    '2'
-                } else {
-                    'é'
-                }
-            }
-            '3' => {
-                if s {
-                    '3'
-                } else {
-                    '"'
-                }
-            }
-            '4' => {
-                if s {
-                    '4'
-                } else {
-                    '\''
-                }
-            }
-            '5' => {
-                if s {
-                    '5'
-                } else {
-                    '('
-                }
-            }
-            '6' => {
-                if s {
-                    '6'
-                } else {
-                    '-'
-                }
-            }
-            '7' => {
-                if s {
-                    '7'
-                } else {
-                    'è'
-                }
-            }
-            '8' => {
-                if s {
-                    '8'
-                } else {
-                    '_'
-                }
-            }
-            '9' => {
-                if s {
-                    '9'
-                } else {
-                    'ç'
-                }
-            }
-            '0' => {
-                if s {
-                    '0'
-                } else {
-                    'à'
-                }
-            }
-            '-' => {
-                if s {
-                    '°'
-                } else {
-                    ')'
-                }
-            }
-            '=' => {
-                if s {
-                    '+'
-                } else {
-                    '='
-                }
-            }
-
-            _ => {
-                if s {
-                    c.to_ascii_uppercase()
-                } else {
-                    c
-                }
-            }
-        }),
-        _ => raw_key,
-    }
-}
-
-fn mappings_qwerty(raw_key: Key, modifiers: KeyModifiers) -> Key {
-    let s = modifiers.has_shift();
-    match raw_key {
-        Key::Character(c) => Key::Character(if s { c.to_ascii_uppercase() } else { c }),
-        _ => raw_key,
-    }
-}
-
+static mut KEYBOARD_LAYOUT: Option<KeyboardLayout> = None;
 static mut DOWN_KEYS: Option<Vec<Key>> = None;
-static mut MODIFIERS: KeyModifiers = KeyModifiers::None;
-
-#[derive(Copy, Clone, Debug)]
-enum Kbdmap {
-    Azerty,
-    Qwerty,
-}
-
-impl Kbdmap {
-    fn get(&self) -> fn(Key, KeyModifiers) -> Key {
-        match self {
-            Kbdmap::Azerty => mappings_azerty,
-            Kbdmap::Qwerty => mappings_qwerty,
-        }
-    }
-}
-
-static mut KBD_MAP: Kbdmap = Kbdmap::Qwerty;
+static mut MODIFIERS: KeyModifiers = KeyModifiers::empty();
 
 #[allow(static_mut_refs)]
 pub fn handler(
@@ -376,6 +173,12 @@ pub fn handler(
     _ifc: &mut InterruptFrameContext,
     _ife: Option<&mut InterruptFrameExtra>,
 ) {
+    let layout = unsafe {
+        if KEYBOARD_LAYOUT.is_none() {
+            KEYBOARD_LAYOUT = Some(KeyboardLayout::default_en_us());
+        }
+        KEYBOARD_LAYOUT.as_ref().unwrap()
+    };
     let key = read_keyboard_layout_en_us();
 
     let Some(down_keys) = (unsafe {
@@ -401,7 +204,7 @@ pub fn handler(
 
                 // Update modifiers
                 unsafe {
-                    MODIFIERS += key.modifiers();
+                    MODIFIERS |= key.modifiers();
                 }
             }
             KeyboardEventKind::KeyUp => {
@@ -412,23 +215,13 @@ pub fn handler(
 
                 // Update modifiers
                 unsafe {
-                    MODIFIERS -= key.modifiers();
+                    MODIFIERS &= !key.modifiers();
                 }
             }
             _ => {}
         }
 
-        if key == Key::F(1) && kind == KeyboardEventKind::KeyUp {
-            unsafe {
-                KBD_MAP = match KBD_MAP {
-                    Kbdmap::Azerty => Kbdmap::Qwerty,
-                    Kbdmap::Qwerty => Kbdmap::Azerty,
-                };
-                println!("Using keyboard layout: {:?}", KBD_MAP);
-            }
-        }
-
-        let mapped_key = unsafe { KBD_MAP.get()(key, MODIFIERS) };
+        let mapped_key = layout.map(key, unsafe { MODIFIERS });
 
         // Make event
         let event = KeyboardEvent {

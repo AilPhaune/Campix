@@ -2,7 +2,10 @@ use core::mem::offset_of;
 
 use alloc::vec::Vec;
 
-use crate::data::regs::fs_gs_base::{GsBase, KernelGsBase};
+use crate::{
+    data::regs::fs_gs_base::{GsBase, KernelGsBase},
+    process::scheduler::ProcThreadInfo,
+};
 
 #[derive(Default, Debug, Clone)]
 pub struct SyscallData {
@@ -47,13 +50,24 @@ impl SyscallData {
     }
 }
 
+#[repr(u64)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptSource {
+    #[default]
+    /// When the interrupt happened in the kernel
+    Kernel,
+    /// When the interrupt happened in userland
+    User,
+    /// When the interrupt happened via a syscall instruction
+    Syscall,
+}
+
 #[derive(Default, Debug, Clone)]
 pub struct PerCpu {
     pub exists: bool,
     pub core_id: u8,
-    pub interrupted_from_userland: Vec<bool>,
-    pub running_pid: Option<u32>,
-    pub running_tid: Option<u32>,
+    pub interrupt_sources: Vec<InterruptSource>,
+    pub running_thread: Option<ProcThreadInfo>,
     pub syscall_data: SyscallData,
     pub kernel_rsp: u64,
 }
@@ -63,9 +77,8 @@ impl PerCpu {
         PerCpu {
             exists: false,
             core_id: 0,
-            interrupted_from_userland: Vec::new(),
-            running_pid: None,
-            running_tid: None,
+            interrupt_sources: Vec::new(),
+            running_thread: None,
             syscall_data: SyscallData::new(),
             kernel_rsp: 0,
         }
@@ -79,9 +92,8 @@ pub fn init_per_cpu(core_id: u8) {
         PER_CPU[core_id as usize] = PerCpu {
             exists: true,
             core_id,
-            interrupted_from_userland: Vec::new(),
-            running_pid: None,
-            running_tid: None,
+            interrupt_sources: Vec::new(),
+            running_thread: None,
             syscall_data: SyscallData::new(),
             kernel_rsp: 0,
         };
@@ -91,6 +103,7 @@ pub fn init_per_cpu(core_id: u8) {
     }
 }
 
+#[inline(always)]
 pub fn core_id() -> u8 {
     let id: u8;
     unsafe {
@@ -99,6 +112,7 @@ pub fn core_id() -> u8 {
     id
 }
 
+#[inline(always)]
 pub fn get_per_cpu() -> &'static mut PerCpu {
     unsafe { &mut PER_CPU[core_id() as usize] }
 }
