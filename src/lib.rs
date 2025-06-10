@@ -4,12 +4,8 @@
 
 use core::num::NonZeroUsize;
 
-use alloc::{
-    boxed::Box,
-    string::{String, ToString},
-    vec::Vec,
-};
-use data::file::{DirectoryEntry, File};
+use alloc::{boxed::Box, string::ToString, vec::Vec};
+use data::file::File;
 use drivers::{
     fs::phys::ext2::Ext2Volume,
     pci,
@@ -117,67 +113,9 @@ pub fn _start(obsiboot_ptr: u64) -> ! {
                 .mount(&"system".chars().collect::<Vec<char>>(), Box::new(ext2))
                 .unwrap();
             drop(wguard);
-
-            println!("\nListing files:");
-            let directory = DirectoryEntry::of("/").unwrap();
-            dumpfs_tree(&directory, 0);
-            println!();
         }
 
         kmain(obsiboot);
-    }
-}
-
-pub fn dumpfs_tree(dir: &DirectoryEntry, indent: usize) {
-    let name = dir.name();
-    let name = name.iter().collect::<String>();
-    println!("{}/{}", " ".repeat(indent), name);
-    if let Ok(dir) = dir.get_dir() {
-        for entry in dir.list().unwrap().iter() {
-            dumpfs_tree(entry, indent + 2);
-        }
-    }
-}
-
-pub fn hexdump(data: &[u8]) {
-    let num_full_lines = data.len() / 16;
-    for i in 0..num_full_lines {
-        printf!("{:#06x}: ", i * 16);
-        let line = &data[i * 16..(i + 1) * 16];
-        for b in line.iter() {
-            printf!("{:02x} ", *b);
-        }
-        printf!(" | ");
-        for b in line.iter() {
-            let c = *b as char;
-            if c.is_ascii_graphic() {
-                printf!("{}", c);
-            } else {
-                printf!(".");
-            }
-        }
-        println!();
-    }
-
-    if data.len() % 16 != 0 {
-        printf!("{:#06x}: ", num_full_lines * 16);
-        let line = &data[num_full_lines * 16..];
-        for b in line.iter() {
-            printf!("{:02x} ", *b);
-        }
-        for _ in 0..(16 - line.len()) {
-            printf!("   ");
-        }
-        printf!(" | ");
-        for b in line.iter() {
-            let c = *b as char;
-            if c.is_ascii_graphic() {
-                printf!("{}", c);
-            } else {
-                printf!(".");
-            }
-        }
-        println!();
     }
 }
 
@@ -246,8 +184,6 @@ unsafe fn kmain(obsiboot: ObsiBootKernelParameters) -> ! {
         }
     };
 
-    println!("{:#?}", executable);
-
     let options = match executable.create_process(
         "sysinit".to_string(),
         "/system/sysinit".to_string(),
@@ -264,8 +200,6 @@ unsafe fn kmain(obsiboot: ObsiBootKernelParameters) -> ! {
             panic!("Campix: failed to boot...");
         }
     };
-
-    println!("{:#?}", options);
 
     SCHEDULER.create_process(options);
     SCHEDULER.schedule();
