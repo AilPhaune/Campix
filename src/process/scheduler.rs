@@ -10,6 +10,7 @@ use crate::{
     interrupts::handlers::syscall::linux::SIGKILL,
     paging::{get_kernel_page_table, PageTable, PAGE_ACCESSED, PAGE_PRESENT, PAGE_RW, PAGE_USER},
     percpu::{core_id, get_per_cpu, InterruptSource},
+    process::ui::context::UiContext,
 };
 
 use super::{
@@ -31,13 +32,15 @@ pub struct SchedulerProcessCreateState {
 
 #[derive(Debug)]
 pub struct Scheduler {
-    processes: RwLock<BTreeMap<u32, Process>>,
+    processes: RwLock<BTreeMap<u32, Arc<Process>>>,
     threads: RwLock<BTreeMap<u32, ProcThreadInfo>>,
     proc_create_state: Mutex<SchedulerProcessCreateState>,
 
     task_queue: Mutex<VecDeque<ProcThreadInfo>>,
 
     thread_settings: Mutex<SchedulerThreadSettings>,
+
+    focused_thread: Mutex<Option<ProcThreadInfo>>,
 }
 
 #[derive(Debug, Clone)]
@@ -69,10 +72,12 @@ impl Scheduler {
                 max_user_stack_pages: 256,
                 max_kernel_stack_pages: 32,
             }),
+
+            focused_thread: Mutex::new(None),
         }
     }
 
-    pub fn get_process(&self, pid: u32) -> Option<Process> {
+    pub fn get_process(&self, pid: u32) -> Option<Arc<Process>> {
         self.processes.read().get(&pid).cloned()
     }
 
@@ -95,53 +100,53 @@ impl Scheduler {
     pub fn create_process(&self, options: CreateProcessOptions) -> u32 {
         let pid = self.get_next_pid();
 
-        let name = Arc::new(options.name);
         let pml4 = options.page_table.get_pml4();
 
-        let process = Process {
-            name: name.clone(),
-            cmdline: Arc::new(options.cmdline),
-            cwd: Arc::new(Mutex::new(options.cwd)),
+        let process = Arc::new(Process {
+            name: options.name.clone(),
+            cmdline: options.cmdline,
+            cwd: Mutex::new(options.cwd),
             pid,
-            page_table: Arc::new(Mutex::new(options.page_table)),
+            page_table: Mutex::new(options.page_table),
             pml4,
-            heap: Arc::new(Mutex::new(ProcessHeap::new())),
+            heap: Mutex::new(ProcessHeap::new()),
             uid: options.uid,
             gid: options.gid,
-            effective_process_access: Arc::new(Mutex::new(ProcessAccess {
+            effective_process_access: Mutex::new(ProcessAccess {
                 euid: options.uid,
                 egid: options.gid,
                 supplementary_gids: options.supplementary_gids,
-            })),
-            allocated_code: Arc::new(Mutex::new(options.allocated_code)),
-            syscalls: Arc::new(Mutex::new(options.syscalls)),
-            threads: Arc::new(Mutex::new(Vec::new())),
-            zombie_threads: Arc::new(Mutex::new(Vec::new())),
-            state: Arc::new(Mutex::new(TaskState::Init)),
-        };
+            }),
+            allocated_code: Mutex::new(options.allocated_code),
+            syscalls: Mutex::new(options.syscalls),
+            threads: Mutex::new(Vec::new()),
+            zombie_threads: Mutex::new(Vec::new()),
+            state: Mutex::new(TaskState::Init),
+        });
 
         let mut pt = process.page_table.lock();
 
         let thread = Arc::new(Thread {
             pid,
             tid: pid,
-            name,
+            name: options.name,
             process: process.clone(),
-            kernel_stack: Arc::new(Mutex::new(ThreadStack::new_with_pages(
+            kernel_stack: Mutex::new(ThreadStack::new_with_pages(
                 PROC_KERNEL_STACK_TOP,
                 1,
                 &mut pt,
                 PAGE_PRESENT | PAGE_RW | PAGE_ACCESSED,
-            ))),
-            stack: Arc::new(Mutex::new(ThreadStack::new_with_pages(
+            )),
+            stack: Mutex::new(ThreadStack::new_with_pages(
                 PROC_USER_STACK_TOP,
                 1,
                 &mut pt,
                 PAGE_PRESENT | PAGE_RW | PAGE_ACCESSED | PAGE_USER,
-            ))),
-            state: Arc::new(Mutex::new(options.main_thread_state)),
-            running_cpu: Arc::new(Mutex::new(None)),
-            task_state: Arc::new(Mutex::new(TaskState::Init)),
+            )),
+            state: Mutex::new(options.main_thread_state),
+            running_cpu: Mutex::new(None),
+            task_state: Mutex::new(TaskState::Init),
+            ui_context: Mutex::new(UiContext::pid_tid(pid, pid)),
         });
 
         drop(pt);
@@ -228,7 +233,7 @@ impl Scheduler {
 
         let mut lock = self.processes.write();
         if let Some(p) = lock.remove(&pid) {
-            let process: Process = p;
+            let process: Arc<Process> = p;
             drop(lock);
 
             let mut ptlock = process.page_table.lock();
@@ -383,6 +388,13 @@ impl Scheduler {
                 core::hint::spin_loop();
             }
         }
+    }
+
+    pub fn get_focused_thread(&self) -> Option<ProcThreadInfo> {
+        let lock = self.focused_thread.lock();
+        let value = (*lock).clone();
+        drop(lock);
+        value
     }
 }
 

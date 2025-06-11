@@ -2,7 +2,10 @@ use core::cmp::Ordering;
 
 use alloc::collections::{btree_map::Entry, BTreeMap};
 
-use crate::{debuggable_bitset_enum, println};
+use crate::{
+    debuggable_bitset_enum, println,
+    process::{scheduler::SCHEDULER, ui::events::UiEvent},
+};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum KeyboardEventKind {
@@ -222,5 +225,9 @@ impl KeyboardLayout {
 
 /// Handles a keyboard event from the keyboard driver
 pub fn handle_keyboard_event(event: KeyboardEvent) {
-    println!("{:?}", event);
+    if let Some(thread) = SCHEDULER.get_focused_thread() {
+        let mut lock = thread.thread.ui_context.lock();
+        lock.events.push_back(UiEvent::KeyboardEvent(event));
+        drop(lock);
+    }
 }

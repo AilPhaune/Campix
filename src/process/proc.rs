@@ -8,7 +8,7 @@ use crate::{
     gdt::{USERLAND_CODE64_SELECTOR, USERLAND_DATA64_SELECTOR},
     paging::PageTable,
     percpu::get_per_cpu,
-    process::task::get_tss_ref,
+    process::{task::get_tss_ref, ui::context::UiContext},
 };
 
 use super::{
@@ -53,29 +53,29 @@ pub enum TaskState {
     Dead,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Process {
     pub pid: u32,
-    pub name: Arc<String>,
-    pub cmdline: Arc<String>,
-    pub cwd: Arc<Mutex<String>>,
+    pub name: String,
+    pub cmdline: String,
+    pub cwd: Mutex<String>,
 
     pub uid: u32,
     pub gid: u32,
 
-    pub effective_process_access: Arc<Mutex<ProcessAccess>>,
+    pub effective_process_access: Mutex<ProcessAccess>,
 
-    pub page_table: Arc<Mutex<PageTable>>,
+    pub page_table: Mutex<PageTable>,
     pub pml4: u64,
-    pub heap: Arc<Mutex<ProcessHeap>>,
+    pub heap: Mutex<ProcessHeap>,
 
-    pub threads: Arc<Mutex<Vec<Arc<Thread>>>>,
-    pub zombie_threads: Arc<Mutex<Vec<Arc<Thread>>>>,
+    pub threads: Mutex<Vec<Arc<Thread>>>,
+    pub zombie_threads: Mutex<Vec<Arc<Thread>>>,
 
-    pub allocated_code: Arc<Mutex<ProcessAllocatedCode>>,
-    pub syscalls: Arc<Mutex<ProcessSyscallABI>>,
+    pub allocated_code: Mutex<ProcessAllocatedCode>,
+    pub syscalls: Mutex<ProcessSyscallABI>,
 
-    pub state: Arc<Mutex<TaskState>>,
+    pub state: Mutex<TaskState>,
 }
 
 #[repr(C, packed(8))]
@@ -110,21 +110,23 @@ pub struct ThreadState {
     pub gs_base: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Thread {
     pub pid: u32,
     pub tid: u32,
-    pub process: Process,
-    pub name: Arc<String>,
+    pub process: Arc<Process>,
+    pub name: String,
 
-    pub stack: Arc<Mutex<ThreadStack>>,
-    pub kernel_stack: Arc<Mutex<ThreadStack>>,
+    pub stack: Mutex<ThreadStack>,
+    pub kernel_stack: Mutex<ThreadStack>,
 
-    pub state: Arc<Mutex<ThreadState>>,
+    pub state: Mutex<ThreadState>,
 
-    pub running_cpu: Arc<Mutex<Option<u8>>>,
+    pub running_cpu: Mutex<Option<u8>>,
 
-    pub task_state: Arc<Mutex<TaskState>>,
+    pub task_state: Mutex<TaskState>,
+
+    pub ui_context: Mutex<UiContext>,
 }
 
 impl Thread {
