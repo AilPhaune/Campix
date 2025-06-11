@@ -18,6 +18,7 @@ pub fn handler(
     mut ife: Option<&mut InterruptFrameExtra>,
 ) {
     let per_cpu = get_per_cpu();
+    per_cpu.ensure_enough_allocated_buffers(16);
 
     macro_rules! print_info {
         () => {
@@ -62,6 +63,7 @@ pub fn handler(
 
 pub fn handler_fast() {
     let per_cpu = get_per_cpu();
+    per_cpu.ensure_enough_allocated_buffers(16);
     per_cpu.interrupt_sources.push(InterruptSource::Syscall);
 
     if let Some(thread) = &per_cpu.running_thread {

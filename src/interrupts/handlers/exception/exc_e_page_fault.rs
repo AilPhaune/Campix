@@ -131,14 +131,27 @@ pub fn handler(
                     let mut pt = th.process.page_table.lock();
                     let mut kstack = th.kernel_stack.lock();
 
+                    let mut fixed = true;
+
                     while npages > kstack.stack_buffers.len() as u64 {
-                        kstack.grow(&mut pt, PAGE_PRESENT | PAGE_RW | PAGE_ACCESSED);
+                        if let Some(buffer) = per_cpu.free_allocated_buffers.pop() {
+                            kstack.grow_using_existing_buffer(
+                                &mut pt,
+                                PAGE_PRESENT | PAGE_RW | PAGE_ACCESSED,
+                                buffer,
+                            );
+                        } else {
+                            fixed = false;
+                            break;
+                        }
                     }
 
                     drop(pt);
                     drop(kstack);
 
-                    return;
+                    if fixed {
+                        return;
+                    }
                 }
             }
             Some(VirtualAddressSpace::LowerHalf(LowerHalfAddressSpace::ProcessStack)) => {

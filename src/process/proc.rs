@@ -8,7 +8,7 @@ use crate::{
     gdt::{USERLAND_CODE64_SELECTOR, USERLAND_DATA64_SELECTOR},
     paging::PageTable,
     percpu::get_per_cpu,
-    process::{task::get_tss_ref, ui::context::UiContext},
+    process::{io::context::ProcessIOContext, task::get_tss_ref, ui::context::UiContext},
 };
 
 use super::{
@@ -76,6 +76,8 @@ pub struct Process {
     pub syscalls: Mutex<ProcessSyscallABI>,
 
     pub state: Mutex<TaskState>,
+
+    pub io_context: Mutex<ProcessIOContext>,
 }
 
 #[repr(C, packed(8))]

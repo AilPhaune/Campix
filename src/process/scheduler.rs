@@ -10,7 +10,7 @@ use crate::{
     interrupts::handlers::syscall::linux::SIGKILL,
     paging::{get_kernel_page_table, PageTable, PAGE_ACCESSED, PAGE_PRESENT, PAGE_RW, PAGE_USER},
     percpu::{core_id, get_per_cpu, InterruptSource},
-    process::ui::context::UiContext,
+    process::{io::context::ProcessIOContext, ui::context::UiContext},
 };
 
 use super::{
@@ -122,6 +122,7 @@ impl Scheduler {
             threads: Mutex::new(Vec::new()),
             zombie_threads: Mutex::new(Vec::new()),
             state: Mutex::new(TaskState::Init),
+            io_context: Mutex::new(ProcessIOContext::new()),
         });
 
         let mut pt = process.page_table.lock();

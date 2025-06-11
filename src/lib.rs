@@ -16,6 +16,8 @@ use obsiboot::ObsiBootKernelParameters;
 use paging::{init_paging, physical_to_virtual};
 use process::{executable::parse_executable, scheduler::SCHEDULER};
 
+use crate::data::permissions::Permissions;
+
 extern crate alloc;
 
 pub mod data;
@@ -97,6 +99,7 @@ pub fn _start(obsiboot_ptr: u64) -> ! {
             let file = File::open(
                 "/dev/pata_pm_p0",
                 OPEN_MODE_READ | OPEN_MODE_WRITE | OPEN_MODE_BINARY,
+                Permissions::from_u64(0),
             )
             .unwrap();
             let ext2 = Ext2Volume::from_device(

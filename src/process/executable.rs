@@ -3,7 +3,7 @@ use core::fmt::Debug;
 use alloc::{boxed::Box, string::String, vec::Vec};
 
 use crate::{
-    data::file::File,
+    data::{file::File, permissions::Permissions},
     drivers::vfs::{AsAny, OPEN_MODE_BINARY, OPEN_MODE_READ},
     formats::elf::Elf64File,
 };
@@ -25,7 +25,11 @@ pub trait ExecutableFileFormat: AsAny + Debug {
 pub fn parse_executable(path: &str) -> Result<Box<dyn ExecutableFileFormat>, Vec<Box<dyn Debug>>> {
     let mut errs: Vec<Box<dyn Debug>> = Vec::new();
 
-    let file = match File::open(path, OPEN_MODE_BINARY | OPEN_MODE_READ) {
+    let file = match File::open(
+        path,
+        OPEN_MODE_BINARY | OPEN_MODE_READ,
+        Permissions::from_u64(0),
+    ) {
         Ok(file) => file,
         Err(e) => {
             errs.push(Box::new(e));

@@ -351,6 +351,8 @@ pub const OPEN_MODE_WRITE: u64 = 1 << 1;
 pub const OPEN_MODE_BINARY: u64 = 1 << 2;
 pub const OPEN_MODE_APPEND: u64 = 1 << 3;
 pub const OPEN_MODE_NO_RESIZE: u64 = 1 << 4;
+pub const OPEN_MODE_CREATE: u64 = 1 << 5;
+pub const OPEN_MODE_FAIL_IF_EXISTS: u64 = 1 << 6;
 
 #[derive(Debug, Clone, Copy)]
 pub enum SeekPosition {

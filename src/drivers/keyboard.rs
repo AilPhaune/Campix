@@ -3,7 +3,7 @@ use core::cmp::Ordering;
 use alloc::collections::{btree_map::Entry, BTreeMap};
 
 use crate::{
-    debuggable_bitset_enum, println,
+    debuggable_bitset_enum,
     process::{scheduler::SCHEDULER, ui::events::UiEvent},
 };
 

@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 use crate::{
     paging::{align_down, PageTable, PAGE_SIZE},
     process::memory::{get_address_space, VirtualAddressSpace},
@@ -76,5 +78,38 @@ impl UserProcessBuffer {
     ) -> Option<&'a mut [u8]> {
         self.verify_fully_mapped_impl(page_table)?;
         Some(unsafe { core::slice::from_raw_parts_mut(self.buffer, self.size) })
+    }
+
+    pub fn copy_user_c_str(
+        page_table: &mut PageTable,
+        addr: u64,
+        max_len: u64,
+    ) -> Option<(Vec<u8>, bool)> {
+        let mut vec = Vec::new();
+
+        let end_unaligned = addr + max_len;
+        let end_aligned = align_down(end_unaligned, PAGE_SIZE as u64);
+
+        let mut curr_addr = addr;
+
+        while curr_addr < end_aligned {
+            page_table.translate(curr_addr)?;
+
+            let read = align_down(curr_addr + PAGE_SIZE as u64, PAGE_SIZE as u64)
+                .min(end_unaligned)
+                - curr_addr;
+
+            let slice =
+                unsafe { core::slice::from_raw_parts(curr_addr as *const u8, read as usize) };
+            let idx_of_zero = slice.iter().position(|&x| x == 0).unwrap_or(read as usize);
+            vec.extend_from_slice(&slice[..idx_of_zero]);
+            if idx_of_zero < read as usize {
+                return Some((vec, true));
+            }
+
+            curr_addr += read;
+        }
+
+        Some((vec, false))
     }
 }

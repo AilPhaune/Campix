@@ -407,6 +407,7 @@ pub struct PageTable {
     owns_allocator: bool,
     pml4_phys: u64,
     allocator_owns_pml4: bool,
+    readonly: bool,
 }
 
 unsafe impl Send for PageTable {}
@@ -418,6 +419,17 @@ impl PageTable {
             owns_allocator: false,
             pml4_phys,
             allocator_owns_pml4: false,
+            readonly: false,
+        }
+    }
+
+    pub fn temporary_this() -> Self {
+        Self {
+            allocator: core::ptr::null_mut::<()>() as *mut dyn PageAllocator,
+            owns_allocator: false,
+            pml4_phys: unsafe { Cr3::read() },
+            allocator_owns_pml4: false,
+            readonly: true,
         }
     }
 
@@ -442,6 +454,7 @@ impl PageTable {
                 owns_allocator: true,
                 pml4_phys: pml4 as u64 - DIRECT_MAPPING_OFFSET,
                 allocator_owns_pml4: true,
+                readonly: false,
             })
         }
     }
@@ -475,6 +488,10 @@ impl PageTable {
         flags: u64,
         invalidate: bool,
     ) -> Option<()> {
+        if self.readonly {
+            return None;
+        }
+
         let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = split_virt_addr(virt);
 
         let sub_flags = if virt >= 0xFFFF_8000_0000_0000 {
@@ -509,6 +526,9 @@ impl PageTable {
         flags: u64,
         invalidate: bool,
     ) -> Option<()> {
+        if self.readonly {
+            return None;
+        }
         let (pml4_idx, pdpt_idx, pd_idx, _) = split_virt_addr(virt);
 
         let sub_flags = if virt >= 0xFFFF_8000_0000_0000 {
@@ -535,6 +555,9 @@ impl PageTable {
     /// - `virt` must be page aligned <br>
     /// - `flags` must be valid <br>
     pub unsafe fn unmap_4kb(&mut self, virt: u64, invalidate: bool) -> Option<()> {
+        if self.readonly {
+            return None;
+        }
         let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = split_virt_addr(virt);
 
         let allocator = &mut *self.allocator;
@@ -566,6 +589,9 @@ impl PageTable {
     /// - `virt` must be 2mb aligned <br>
     /// - `flags` must be valid <br>
     pub unsafe fn unmap_2mb(&mut self, virt: u64, invalidate: bool) -> Option<()> {
+        if self.readonly {
+            return None;
+        }
         let (pml4_idx, pdpt_idx, pd_idx, _) = split_virt_addr(virt);
 
         let allocator = &mut *self.allocator;
@@ -599,7 +625,10 @@ impl PageTable {
         virt_offset: u64,
         flags: u64,
         invalidate: bool,
-    ) {
+    ) -> Option<()> {
+        if self.readonly {
+            return None;
+        }
         unsafe {
             let begin_2mb = align_up(addr, MB2 as u64);
             let end_2mb = align_down(addr + len, MB2 as u64);
@@ -614,7 +643,7 @@ impl PageTable {
 
             let mut addr = begin_2mb;
             while addr < end_2mb {
-                self.map_2mb(addr + virt_offset, addr, flags, invalidate_each);
+                self.map_2mb(addr + virt_offset, addr, flags, invalidate_each)?;
                 addr += MB2 as u64;
             }
 
@@ -625,13 +654,13 @@ impl PageTable {
                     addr,
                     PAGE_ACCESSED | PAGE_RW,
                     invalidate_each,
-                );
+                )?;
                 addr += KB4 as u64;
             }
 
             let mut addr = end_2mb;
             while addr < end_4kb {
-                self.map_4kb(addr + virt_offset, addr, flags, invalidate_each);
+                self.map_4kb(addr + virt_offset, addr, flags, invalidate_each)?;
                 addr += KB4 as u64;
             }
 
@@ -639,6 +668,7 @@ impl PageTable {
                 self.invalidate();
             }
         }
+        Some(())
     }
 
     /// # Safety
@@ -653,6 +683,9 @@ impl PageTable {
     }
 
     pub fn map_global_higher_half(&mut self) {
+        if self.readonly {
+            return;
+        }
         unsafe {
             let k = get_kernel_page_table().lock();
             let k_pml4 = &mut *((k.pml4_phys + DIRECT_MAPPING_OFFSET) as *mut Table);
@@ -673,6 +706,9 @@ impl PageTable {
     }
 
     pub fn unmap_global_higher_half(&mut self) {
+        if self.readonly {
+            return;
+        }
         unsafe {
             let pml4 = &mut *((self.pml4_phys + DIRECT_MAPPING_OFFSET) as *mut Table);
 
@@ -693,19 +729,12 @@ impl PageTable {
     pub fn translate(&mut self, virt: u64) -> Option<u64> {
         unsafe {
             let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = split_virt_addr(virt);
-            println!(
-                "Translating virt: {:#x}. PML4 idx: {}, PDPT idx: {}, PD idx: {}, PT idx: {}",
-                virt, pml4_idx, pdpt_idx, pd_idx, pt_idx
-            );
 
             let allocator = &mut *self.allocator;
 
             let pml4: &mut Table = &mut *((self.pml4_phys + DIRECT_MAPPING_OFFSET) as *mut Table);
-            println!("pml4[{}] = {:#x}", pml4_idx, pml4.0[pml4_idx]);
             let pdpt = pml4.get_table::<false>(pml4_idx, allocator, 0, 0)?;
-            println!("pdpt[{}] = {:#x}", pdpt_idx, pdpt.0[pdpt_idx]);
             let pd = pdpt.get_table::<false>(pdpt_idx, allocator, 0, 0)?;
-            println!("pd[{}] = {:#x}", pd_idx, pd.0[pd_idx]);
 
             let pd_entry = *pd.get_entry(pd_idx);
             if (pd_entry & PAGE_PRESENT) == PAGE_PRESENT && (pd_entry & PAGE_HUGE) == PAGE_HUGE {
@@ -713,7 +742,6 @@ impl PageTable {
             }
 
             let pt = pd.get_table::<false>(pd_idx, allocator, 0, PAGE_HUGE)?;
-            println!("pt[{}] = {:#x}", pt_idx, pt.0[pt_idx]);
             let pt_entry = *pt.get_entry(pt_idx);
             if (pt_entry & PAGE_PRESENT) == PAGE_PRESENT {
                 return Some((pt_entry & 0x000F_FFFF_FFFF_F000) + (virt % PAGE_SIZE as u64));
@@ -734,7 +762,7 @@ impl PageTable {
 impl Drop for PageTable {
     fn drop(&mut self) {
         unsafe {
-            if self.pml4_phys == 0 {
+            if self.pml4_phys == 0 || self.readonly {
                 return;
             }
             if Cr3::read() == self.pml4_phys {
@@ -816,5 +844,15 @@ where
             f = in(reg) &f,
             options(noreturn)
         );
+    }
+}
+
+impl PageAllocator for () {
+    fn alloc_page(&mut self) -> Option<*mut u8> {
+        panic!("()::alloc_page")
+    }
+
+    fn free_page(&mut self, _page: *mut u8) {
+        panic!("()::free_page")
     }
 }

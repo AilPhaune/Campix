@@ -2,9 +2,12 @@ use core::fmt::Debug;
 
 use alloc::{string::String, vec::Vec};
 
-use crate::drivers::vfs::{
-    get_vfs, Arcrwb, FileStat, FileSystem, PathTraverse, SeekPosition, VfsError, VfsFile,
-    VfsFileKind,
+use crate::{
+    data::permissions::Permissions,
+    drivers::vfs::{
+        get_vfs, Arcrwb, FileStat, FileSystem, PathTraverse, SeekPosition, VfsError, VfsFile,
+        VfsFileKind,
+    },
 };
 
 pub struct File {
@@ -26,7 +29,8 @@ impl Debug for File {
 }
 
 impl File {
-    pub fn open(path: &str, mode: u64) -> Result<File, VfsError> {
+    // TODO: Add create_perms on FileSystem interface
+    pub fn open(path: &str, mode: u64, _create_perms: Permissions) -> Result<File, VfsError> {
         let path = path.chars().collect::<Vec<char>>();
         let fs = get_vfs();
         let mut guard = fs.write();
@@ -48,6 +52,24 @@ impl File {
         })
     }
 
+    pub fn open_raw(
+        path: &[char],
+        mode: u64,
+        _create_perms: Permissions,
+    ) -> Result<(Arcrwb<dyn FileSystem>, u64), VfsError> {
+        let fs = get_vfs();
+        let mut guard = fs.write();
+        let file = guard.get_file(path)?;
+        let fs = guard
+            .get_fs_by_id(file.fs())
+            .ok_or(VfsError::FileSystemNotMounted)?;
+        drop(guard);
+        let mut guard = fs.write();
+        let handle = guard.fopen(&file, mode)?;
+        drop(guard);
+        Ok((fs, handle))
+    }
+
     pub fn get_stats(path: &str) -> Result<Option<FileStat>, VfsError> {
         let path = path.chars().collect::<Vec<char>>();
         let fs = get_vfs();
@@ -55,7 +77,7 @@ impl File {
         guard.get_stats(&path)
     }
 
-    pub fn create(path: &str, mode: u64) -> Result<File, VfsError> {
+    pub fn create(path: &str, mode: u64, _perms: Permissions) -> Result<File, VfsError> {
         let path = path.chars().collect::<Vec<char>>();
         let name_start = path
             .iter()
@@ -78,6 +100,7 @@ impl File {
             .ok_or(VfsError::FileSystemNotMounted)?;
         drop(guard);
         let mut guard = fs.write();
+        // TODO: Use perms
         let file = guard.create_child(&directory, filename, VfsFileKind::File)?;
         let handle = guard.fopen(&file, mode)?;
         drop(guard);

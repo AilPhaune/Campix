@@ -7,6 +7,9 @@ pub const GROUP_EXECUTE: u64 = 1 << 5;
 pub const OTHER_READ: u64 = 1 << 6;
 pub const OTHER_WRITE: u64 = 1 << 7;
 pub const OTHER_EXECUTE: u64 = 1 << 8;
+pub const STICKY_BIT: u64 = 1 << 9;
+pub const SETUID_BIT: u64 = 1 << 10;
+pub const SETGID_BIT: u64 = 1 << 11;
 
 pub const EXTENDED_PERMISSIONS: u64 = 1 << 63;
 

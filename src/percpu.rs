@@ -1,9 +1,12 @@
 use core::mem::offset_of;
 
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 
 use crate::{
-    data::regs::fs_gs_base::{GsBase, KernelGsBase},
+    data::{
+        calloc_boxed_slice,
+        regs::fs_gs_base::{GsBase, KernelGsBase},
+    },
     process::scheduler::ProcThreadInfo,
 };
 
@@ -70,6 +73,7 @@ pub struct PerCpu {
     pub running_thread: Option<ProcThreadInfo>,
     pub syscall_data: SyscallData,
     pub kernel_rsp: u64,
+    pub free_allocated_buffers: Vec<Box<[u8]>>,
 }
 
 impl PerCpu {
@@ -81,6 +85,14 @@ impl PerCpu {
             running_thread: None,
             syscall_data: SyscallData::new(),
             kernel_rsp: 0,
+            free_allocated_buffers: Vec::new(),
+        }
+    }
+
+    pub fn ensure_enough_allocated_buffers(&mut self, count: usize) {
+        for _ in self.free_allocated_buffers.len()..count {
+            self.free_allocated_buffers
+                .push(calloc_boxed_slice::<u8>(4096));
         }
     }
 }
@@ -96,6 +108,7 @@ pub fn init_per_cpu(core_id: u8) {
             running_thread: None,
             syscall_data: SyscallData::new(),
             kernel_rsp: 0,
+            free_allocated_buffers: Vec::new(),
         };
 
         KernelGsBase::set(&PER_CPU[core_id as usize] as *const _ as u64);

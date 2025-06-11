@@ -150,15 +150,28 @@ impl ThreadStack {
 
     pub fn grow(&mut self, table: &mut PageTable, flags: u64) {
         let new_buffer = calloc_boxed_slice::<u8>(PAGE_SIZE);
+        self.grow_using_existing_buffer(table, flags, new_buffer);
+    }
+
+    pub fn grow_using_existing_buffer(
+        &mut self,
+        table: &mut PageTable,
+        flags: u64,
+        buffer: Box<[u8]>,
+    ) -> bool {
+        if buffer.len() != PAGE_SIZE {
+            return false;
+        }
         self.stack_size += PAGE_SIZE as u64;
 
-        let kernel_virt = new_buffer.as_ptr() as u64;
+        let kernel_virt = buffer.as_ptr() as u64;
         let phys = kernel_virt - DIRECT_MAPPING_OFFSET;
         let proc_virt = self.get_bottom();
 
         unsafe { table.map_4kb(proc_virt, phys, flags, true) };
 
-        self.stack_buffers.push(new_buffer);
+        self.stack_buffers.push(buffer);
+        true
     }
 
     pub fn free(&mut self, table: &mut PageTable) {
