@@ -5,7 +5,8 @@ use crate::{
     interrupts::{
         handlers::syscall::linux::{
             io::{
-                linux_sys_close, linux_sys_lseek, linux_sys_open, linux_sys_read, linux_sys_write,
+                linux_sys_close, linux_sys_lseek, linux_sys_mkdir, linux_sys_open, linux_sys_read,
+                linux_sys_write,
             },
             kernel_info::linux_sys_uname,
             processes::linux_sys_sched_yield,
@@ -80,6 +81,7 @@ fn linux_syscall0(
         24 => linux_sys_sched_yield(thread),
         60 => linux_sys_exit(thread.tid, arg0),
         63 => linux_sys_uname(thread, arg0),
+        83 => linux_sys_mkdir(thread, arg0, arg1),
         _ => (-(ENOSYS as i64)) as u64,
     }
 }

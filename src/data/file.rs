@@ -56,7 +56,7 @@ impl File {
         path: &[char],
         mode: u64,
         _create_perms: Permissions,
-    ) -> Result<(Arcrwb<dyn FileSystem>, u64), VfsError> {
+    ) -> Result<(Arcrwb<dyn FileSystem>, u64, VfsFile), VfsError> {
         let fs = get_vfs();
         let mut guard = fs.write();
         let file = guard.get_file(path)?;
@@ -67,7 +67,7 @@ impl File {
         let mut guard = fs.write();
         let handle = guard.fopen(&file, mode)?;
         drop(guard);
-        Ok((fs, handle))
+        Ok((fs, handle, file))
     }
 
     pub fn get_stats(path: &str) -> Result<Option<FileStat>, VfsError> {
@@ -75,6 +75,12 @@ impl File {
         let fs = get_vfs();
         let mut guard = fs.write();
         guard.get_stats(&path)
+    }
+
+    pub fn get_stats0(path: &[char]) -> Result<Option<FileStat>, VfsError> {
+        let fs = get_vfs();
+        let mut guard = fs.write();
+        guard.get_stats(path)
     }
 
     pub fn create(path: &str, mode: u64, _perms: Permissions) -> Result<File, VfsError> {
@@ -116,9 +122,13 @@ impl File {
 
     pub fn delete(path: &str) -> Result<(), VfsError> {
         let path = path.chars().collect::<Vec<char>>();
+        Self::delete0(&path)
+    }
+
+    pub fn delete0(path: &[char]) -> Result<(), VfsError> {
         let fs = get_vfs();
         let mut guard = fs.write();
-        let file = guard.get_file(&path)?;
+        let file = guard.get_file(path)?;
         let fs = guard
             .get_fs_by_id(file.fs())
             .ok_or(VfsError::FileSystemNotMounted)?;
@@ -129,7 +139,7 @@ impl File {
         Ok(())
     }
 
-    fn mkdir_impl(path: Vec<char>) -> Result<Directory, VfsError> {
+    pub fn mkdir0(path: Vec<char>) -> Result<Directory, VfsError> {
         let fs = get_vfs();
         let wguard: &mut dyn FileSystem = &mut **fs.write();
         let mut traverse = PathTraverse::new_owned(&path, wguard)?;
@@ -167,7 +177,7 @@ impl File {
 
     pub fn mkdir(path: &str) -> Result<Directory, VfsError> {
         let path = path.chars().collect::<Vec<char>>();
-        Self::mkdir_impl(path)
+        Self::mkdir0(path)
     }
 
     fn open_entry(entry: &DirectoryEntry, mode: u64) -> Result<File, VfsError> {

@@ -4,12 +4,13 @@ use crate::{
     data::{file::File, permissions::Permissions},
     debuggable_bitset_enum,
     drivers::vfs::{
-        SeekPosition, OPEN_MODE_APPEND, OPEN_MODE_CREATE, OPEN_MODE_FAIL_IF_EXISTS, OPEN_MODE_READ,
-        OPEN_MODE_WRITE,
+        FileStat, SeekPosition, VfsFileKind, OPEN_MODE_APPEND, OPEN_MODE_CREATE,
+        OPEN_MODE_FAIL_IF_EXISTS, OPEN_MODE_READ, OPEN_MODE_WRITE,
     },
     interrupts::handlers::syscall::{
         linux::{
-            vfs_err_to_linux_errno, EBADF, EINVAL, EMFILE, WHENCE_CUR, WHENCE_END, WHENCE_SET,
+            vfs_err_to_linux_errno, EBADF, EINVAL, EMFILE, ENOENT, ENOTDIR, EPERM, WHENCE_CUR,
+            WHENCE_END, WHENCE_SET,
         },
         utils::buffer::UserProcessBuffer,
     },
@@ -47,6 +48,17 @@ const SUPPORTED_OPEN_FLAGS: u64 = LinuxOpenFlags::empty()
     .get();
 
 const SUPPORTED_PERMISSION_FLAGS: u64 = 0o7777; // sticky, setuid, setgid, rwxrwxrwx
+
+pub enum IoAction {
+    Open(LinuxOpenFlags),
+    CreateChild(VfsFileKind, u64),
+    Rmdir,
+}
+
+pub fn cant(_thread: &ProcThreadInfo, _stat: &FileStat, _action: IoAction) -> bool {
+    // TODO: check perms
+    false
+}
 
 pub fn linux_sys_read(thread: &ProcThreadInfo, fd: u64, buf: u64, count: u64) -> u64 {
     let space = get_address_space(buf);
@@ -161,17 +173,25 @@ pub fn linux_sys_open(thread: &ProcThreadInfo, path: u64, flags: u64, mode: u64)
         open_mode |= OPEN_MODE_APPEND;
     }
 
-    let (fs, handle) = match File::open_raw(
-        &user_buffer
-            .iter()
-            .map(|x| *x as char)
-            .collect::<Vec<char>>(),
-        open_mode,
-        Permissions::from_u64(mode),
-    ) {
+    let path = user_buffer
+        .iter()
+        .map(|x| *x as char)
+        .collect::<Vec<char>>();
+
+    let (fs, handle, _) = match File::open_raw(&path, open_mode, Permissions::from_u64(mode)) {
         Ok(f) => f,
         Err(e) => linux_return_err_from_syscall!(vfs_err_to_linux_errno(e)),
     };
+
+    let stat = match File::get_stats0(&path) {
+        Ok(Some(s)) => s,
+        Ok(None) => linux_return_err_from_syscall!(ENOENT),
+        Err(e) => linux_return_err_from_syscall!(vfs_err_to_linux_errno(e)),
+    };
+
+    if cant(thread, &stat, IoAction::Open(flags)) {
+        linux_return_err_from_syscall!(EPERM)
+    }
 
     if flags.has(LinuxOpenFlag::Truncate) {
         if open_mode & OPEN_MODE_WRITE != OPEN_MODE_WRITE {
@@ -255,5 +275,100 @@ pub fn linux_sys_lseek(thread: &ProcThreadInfo, fd: u64, offset: u64, whence: u6
         _ => {
             linux_return_err_from_syscall!(EINVAL)
         }
+    }
+}
+
+pub fn linux_sys_mkdir(thread: &ProcThreadInfo, path: u64, mode: u64) -> u64 {
+    if mode & SUPPORTED_PERMISSION_FLAGS != mode {
+        linux_return_err_from_syscall!(EINVAL)
+    }
+
+    let mut pt = PageTable::temporary_this();
+
+    let Some((user_buffer, true)) = UserProcessBuffer::copy_user_c_str(&mut pt, path, MAX_PATH_LEN)
+    else {
+        linux_return_err_from_syscall!(EINVAL)
+    };
+
+    drop(pt);
+
+    let mut user_cstr = user_buffer
+        .iter()
+        .map(|x| *x as char)
+        .collect::<Vec<char>>();
+    while user_cstr.last() == Some(&'/') {
+        user_cstr.pop();
+    }
+
+    let Some(last_slash) = user_cstr.iter().rposition(|x| *x == '/') else {
+        linux_return_err_from_syscall!(EINVAL)
+    };
+
+    let parent_path = &user_cstr[..last_slash];
+
+    let parent = match File::get_stats0(parent_path) {
+        Ok(Some(parent)) => parent,
+        Ok(None) => linux_return_err_from_syscall!(ENOENT),
+        Err(e) => linux_return_err_from_syscall!(vfs_err_to_linux_errno(e)),
+    };
+
+    if cant(
+        thread,
+        &parent,
+        IoAction::CreateChild(VfsFileKind::Directory, mode),
+    ) {
+        linux_return_err_from_syscall!(EPERM)
+    }
+
+    if !parent.is_directory {
+        linux_return_err_from_syscall!(ENOTDIR)
+    }
+
+    let dir = match File::mkdir0(user_cstr) {
+        Ok(dir) => dir,
+        Err(e) => linux_return_err_from_syscall!(vfs_err_to_linux_errno(e)),
+    };
+
+    // TODO: set dir perms
+    drop(dir);
+
+    0
+}
+
+pub fn linux_sys_rmdir(thread: &ProcThreadInfo, path: u64) -> u64 {
+    let mut pt = PageTable::temporary_this();
+
+    let Some((user_buffer, true)) = UserProcessBuffer::copy_user_c_str(&mut pt, path, MAX_PATH_LEN)
+    else {
+        linux_return_err_from_syscall!(EINVAL)
+    };
+
+    drop(pt);
+
+    let mut user_cstr = user_buffer
+        .iter()
+        .map(|x| *x as char)
+        .collect::<Vec<char>>();
+    while user_cstr.last() == Some(&'/') {
+        user_cstr.pop();
+    }
+
+    let file = match File::get_stats0(&user_cstr) {
+        Ok(Some(f)) => f,
+        Ok(None) => linux_return_err_from_syscall!(ENOENT),
+        Err(e) => linux_return_err_from_syscall!(vfs_err_to_linux_errno(e)),
+    };
+
+    if cant(thread, &file, IoAction::Rmdir) {
+        linux_return_err_from_syscall!(EPERM)
+    }
+
+    if !file.is_directory {
+        linux_return_err_from_syscall!(ENOTDIR)
+    }
+
+    match File::delete0(&user_cstr) {
+        Ok(_) => 0,
+        Err(e) => linux_return_err_from_syscall!(vfs_err_to_linux_errno(e)),
     }
 }
