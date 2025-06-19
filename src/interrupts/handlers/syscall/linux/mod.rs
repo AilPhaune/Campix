@@ -4,7 +4,10 @@ use crate::{
     drivers::vfs::VfsError,
     interrupts::{
         handlers::syscall::linux::{
-            io::{linux_sys_close, linux_sys_open, linux_sys_write},
+            io::{
+                linux_sys_close, linux_sys_lseek, linux_sys_open, linux_sys_read, linux_sys_write,
+            },
+            kernel_info::linux_sys_uname,
             processes::linux_sys_sched_yield,
         },
         idt::{InterruptFrameContext, InterruptFrameExtra, InterruptFrameRegisters},
@@ -14,6 +17,7 @@ use crate::{
 };
 
 pub mod io;
+pub mod kernel_info;
 pub mod processes;
 
 pub const EPERM: u64 = 1;
@@ -30,6 +34,10 @@ pub const ENOSYS: u64 = 38;
 pub const ENOTEMPTY: u64 = 39;
 
 pub const SIGKILL: u64 = 9;
+
+pub const WHENCE_SET: u64 = 0;
+pub const WHENCE_CUR: u64 = 1;
+pub const WHENCE_END: u64 = 2;
 
 #[inline(always)]
 pub fn linux_return_from_syscall(
@@ -64,11 +72,14 @@ fn linux_syscall0(
     thread: &ProcThreadInfo,
 ) -> u64 {
     match intno {
+        0 => linux_sys_read(thread, arg0, arg1, arg2),
         1 => linux_sys_write(thread, arg0, arg1, arg2),
         2 => linux_sys_open(thread, arg0, arg1, arg2),
         3 => linux_sys_close(thread, arg0),
+        8 => linux_sys_lseek(thread, arg0, arg1, arg2),
         24 => linux_sys_sched_yield(thread),
         60 => linux_sys_exit(thread.tid, arg0),
+        63 => linux_sys_uname(thread, arg0),
         _ => (-(ENOSYS as i64)) as u64,
     }
 }

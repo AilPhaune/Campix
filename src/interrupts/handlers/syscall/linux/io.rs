@@ -8,7 +8,9 @@ use crate::{
         OPEN_MODE_WRITE,
     },
     interrupts::handlers::syscall::{
-        linux::{vfs_err_to_linux_errno, EBADF, EINVAL, EMFILE},
+        linux::{
+            vfs_err_to_linux_errno, EBADF, EINVAL, EMFILE, WHENCE_CUR, WHENCE_END, WHENCE_SET,
+        },
         utils::buffer::UserProcessBuffer,
     },
     linux_return_err_from_syscall,
@@ -45,6 +47,41 @@ const SUPPORTED_OPEN_FLAGS: u64 = LinuxOpenFlags::empty()
     .get();
 
 const SUPPORTED_PERMISSION_FLAGS: u64 = 0o7777; // sticky, setuid, setgid, rwxrwxrwx
+
+pub fn linux_sys_read(thread: &ProcThreadInfo, fd: u64, buf: u64, count: u64) -> u64 {
+    let space = get_address_space(buf);
+    let Some(end_addr) = buf.checked_add(count) else {
+        linux_return_err_from_syscall!(EINVAL)
+    };
+
+    let end_space = get_address_space(end_addr);
+    if !matches!(space, Some(VirtualAddressSpace::LowerHalf(..)))
+        || !matches!(end_space, Some(VirtualAddressSpace::LowerHalf(..)))
+    {
+        linux_return_err_from_syscall!(EINVAL)
+    }
+
+    let mut ptlock = thread.thread.process.page_table.lock();
+    let mut user_buffer = UserProcessBuffer::new(buf as *mut u8, count as usize);
+    match user_buffer.verify_fully_mapped_mut(&mut ptlock) {
+        Some(buf) => {
+            let mut io_ctx = thread.thread.process.io_context.lock();
+            let (fs, handle) = match io_ctx.file_table.get_fd(fd as usize) {
+                Some(Some((fs, handle))) => (fs, *handle),
+                _ => linux_return_err_from_syscall!(EBADF),
+            };
+            let mut gfs = fs.write();
+            let read = match gfs.fread(handle, buf) {
+                Ok(w) => w,
+                Err(e) => linux_return_err_from_syscall!(vfs_err_to_linux_errno(e)),
+            };
+            drop(gfs);
+            drop(io_ctx);
+            read
+        }
+        None => linux_return_err_from_syscall!(EMFILE),
+    }
+}
 
 pub fn linux_sys_write(thread: &ProcThreadInfo, fd: u64, buf: u64, count: u64) -> u64 {
     if count > MAX_SINGLE_WRITE {
@@ -168,5 +205,55 @@ pub fn linux_sys_close(thread: &ProcThreadInfo, fd: u64) -> u64 {
         0
     } else {
         linux_return_err_from_syscall!(EBADF)
+    }
+}
+
+pub fn linux_sys_lseek(thread: &ProcThreadInfo, fd: u64, offset: u64, whence: u64) -> u64 {
+    match whence {
+        WHENCE_SET => {
+            let mut io_ctx = thread.thread.process.io_context.lock();
+            if let Some(Some((fs, handle))) = io_ctx.file_table.get_fd(fd as usize) {
+                let mut gfs = fs.write();
+                match gfs.fseek(*handle, SeekPosition::FromStart(offset)) {
+                    Ok(_) => {}
+                    Err(e) => linux_return_err_from_syscall!(vfs_err_to_linux_errno(e)),
+                }
+                drop(gfs);
+                0
+            } else {
+                linux_return_err_from_syscall!(EBADF)
+            }
+        }
+        WHENCE_CUR => {
+            let mut io_ctx = thread.thread.process.io_context.lock();
+            if let Some(Some((fs, handle))) = io_ctx.file_table.get_fd(fd as usize) {
+                let mut gfs = fs.write();
+                match gfs.fseek(*handle, SeekPosition::FromCurrent(offset as i64)) {
+                    Ok(_) => {}
+                    Err(e) => linux_return_err_from_syscall!(vfs_err_to_linux_errno(e)),
+                }
+                drop(gfs);
+                0
+            } else {
+                linux_return_err_from_syscall!(EBADF)
+            }
+        }
+        WHENCE_END => {
+            let mut io_ctx = thread.thread.process.io_context.lock();
+            if let Some(Some((fs, handle))) = io_ctx.file_table.get_fd(fd as usize) {
+                let mut gfs = fs.write();
+                match gfs.fseek(*handle, SeekPosition::FromEnd(offset)) {
+                    Ok(_) => {}
+                    Err(e) => linux_return_err_from_syscall!(vfs_err_to_linux_errno(e)),
+                }
+                drop(gfs);
+                0
+            } else {
+                linux_return_err_from_syscall!(EBADF)
+            }
+        }
+        _ => {
+            linux_return_err_from_syscall!(EINVAL)
+        }
     }
 }
