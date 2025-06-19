@@ -1,4 +1,4 @@
-use core::mem::offset_of;
+use core::{fmt::Debug, mem::offset_of};
 
 use alloc::{boxed::Box, vec::Vec};
 
@@ -65,7 +65,7 @@ pub enum InterruptSource {
     Syscall,
 }
 
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Clone)]
 pub struct PerCpu {
     pub exists: bool,
     pub core_id: u8,
@@ -74,6 +74,23 @@ pub struct PerCpu {
     pub syscall_data: SyscallData,
     pub kernel_rsp: u64,
     pub free_allocated_buffers: Vec<Box<[u8]>>,
+}
+
+impl Debug for PerCpu {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PerCpu")
+            .field("exists", &self.exists)
+            .field("core_id", &self.core_id)
+            .field("interrupt_sources", &self.interrupt_sources)
+            .field("running_thread", &self.running_thread)
+            .field("syscall_data", &self.syscall_data)
+            .field("kernel_rsp", &self.kernel_rsp)
+            .field(
+                "free_allocated_buffers",
+                &format_args!("[...] - {} elements", self.free_allocated_buffers.len()),
+            )
+            .finish()
+    }
 }
 
 impl PerCpu {

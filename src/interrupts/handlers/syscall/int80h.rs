@@ -83,6 +83,8 @@ pub fn handler_fast() {
             ProcessSyscallABI::Linux => linux_syscall_fast(thread),
         };
 
+        per_cpu.interrupt_sources.pop();
+
         return;
     }
     panic!("Bad interrupt.");

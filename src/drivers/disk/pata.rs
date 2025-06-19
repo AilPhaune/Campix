@@ -9,7 +9,7 @@ use crate::{
         vfs::{
             arcrwb_new_from_box, BlockDevice, FileStat, FileSystem, FsSpecificFileData,
             SubBlockDevice, VfsError, VfsFile, VfsFileKind, FLAG_PARTITIONED_DEVICE,
-            FLAG_PHYSICAL_BLOCK_DEVICE, OPEN_MODE_APPEND, OPEN_MODE_BINARY, OPEN_MODE_READ,
+            FLAG_PHYSICAL_BLOCK_DEVICE, OPEN_MODE_APPEND, OPEN_MODE_READ,
         },
     },
     io::{inb, inw, outb, outw},
@@ -558,9 +558,6 @@ impl DevFsDriver for PataDevfsDriver {
         drop(guard);
 
         if mode & OPEN_MODE_APPEND != 0 {
-            return Err(VfsError::InvalidOpenMode);
-        }
-        if mode & OPEN_MODE_BINARY == 0 {
             return Err(VfsError::InvalidOpenMode);
         }
 

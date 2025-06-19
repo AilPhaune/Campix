@@ -15,7 +15,7 @@ use super::{
     vfs::{
         arcrwb_new_from_box, Arcrwb, CharacterDevice, FileStat, FileSystem, FsSpecificFileData,
         VfsError, VfsFile, VfsFileKind, FLAG_SYSTEM, FLAG_VIRTUAL_CHARACTER_DEVICE,
-        OPEN_MODE_APPEND, OPEN_MODE_BINARY, OPEN_MODE_READ, OPEN_MODE_WRITE,
+        OPEN_MODE_APPEND, OPEN_MODE_READ, OPEN_MODE_WRITE,
     },
 };
 
@@ -72,7 +72,7 @@ impl VgaCharDevice {
             fb,
             size,
             paging::DIRECT_MAPPING_OFFSET,
-            paging::PAGE_ACCESSED | paging::PAGE_RW,
+            paging::PAGE_ACCESSED | paging::PAGE_RW | paging::PAGE_PRESENT,
             true,
         );
     }
@@ -395,9 +395,6 @@ impl DevFsDriver for VgaDriver {
         if mode & OPEN_MODE_APPEND != 0 {
             return Err(VfsError::InvalidOpenMode);
         }
-        if mode & OPEN_MODE_BINARY == 0 {
-            return Err(VfsError::InvalidOpenMode);
-        }
 
         let handle = dev_fs.alloc_file_handle::<VgaFsFileHandle>(handle_data, hook);
         self.handles.insert(handle);
@@ -408,6 +405,7 @@ impl DevFsDriver for VgaDriver {
         if !self.handles.contains(&handle) {
             return Err(VfsError::ActionNotAllowed);
         }
+        self.fflush(dev_fs, handle)?;
         self.handles.remove(&handle);
         dev_fs.dealloc_file_handle::<VgaFsFileHandle>(handle);
         Ok(())

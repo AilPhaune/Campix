@@ -4,7 +4,7 @@ use crate::{
     data::alloc_boxed_slice,
     drivers::{
         fs::virt::devfs::fseek_helper,
-        vfs::{BlockDevice, SeekPosition, VfsError, OPEN_MODE_BINARY, OPEN_MODE_WRITE},
+        vfs::{BlockDevice, SeekPosition, VfsError, OPEN_MODE_WRITE},
     },
 };
 
@@ -721,8 +721,7 @@ impl Directory {
         inode: &Inode,
         entry_inode: u32,
     ) -> Result<(), VfsError> {
-        let mut iterator =
-            DirectoryIterator::new(volume, inode.clone(), OPEN_MODE_BINARY | OPEN_MODE_WRITE)?;
+        let mut iterator = DirectoryIterator::new(volume, inode.clone(), OPEN_MODE_WRITE)?;
 
         while let Some(next) = iterator.next() {
             if next.entry.inode == entry_inode {

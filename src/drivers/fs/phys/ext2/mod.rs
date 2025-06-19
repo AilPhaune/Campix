@@ -28,8 +28,7 @@ use crate::{
         vfs::{
             default_get_file_implementation, Arcrwb, BlockDevice, FileHandleAllocator, FileStat,
             FileSystem, FsSpecificFileData, SeekPosition, Vfs, VfsError, VfsFile, VfsFileKind,
-            WeakArcrwb, OPEN_MODE_APPEND, OPEN_MODE_BINARY, OPEN_MODE_NO_RESIZE, OPEN_MODE_READ,
-            OPEN_MODE_WRITE,
+            WeakArcrwb, OPEN_MODE_APPEND, OPEN_MODE_NO_RESIZE, OPEN_MODE_READ, OPEN_MODE_WRITE,
         },
     },
 };
@@ -128,8 +127,7 @@ impl Ext2Volume {
         block_usage_bitmap_cache_size: NonZeroUsize,
         inode_usage_bitmap_cache_size: NonZeroUsize,
     ) -> Result<Self, VfsError> {
-        if (device.get_open_mode() & OPEN_MODE_BINARY) == 0
-            || (device.get_open_mode() & OPEN_MODE_READ) == 0
+        if (device.get_open_mode() & OPEN_MODE_READ) == 0
             || (device.get_open_mode() & OPEN_MODE_APPEND) == OPEN_MODE_APPEND
         {
             return Err(VfsError::InvalidOpenMode);
@@ -390,11 +388,7 @@ impl Ext2Volume {
         let size = inode.get_size(self);
         let (data, kind) = match inode.inode_type {
             InodeType::Directory => (
-                Either::new_right(Directory::new(
-                    self,
-                    inode,
-                    OPEN_MODE_BINARY | OPEN_MODE_READ,
-                )?),
+                Either::new_right(Directory::new(self, inode, OPEN_MODE_READ)?),
                 VfsFileKind::Directory,
             ),
             InodeType::File => (Either::new_left(inode), VfsFileKind::File),
@@ -417,8 +411,7 @@ impl Ext2Volume {
 
     fn dealloc_inode(&mut self, inode: Inode) -> Result<(), VfsError> {
         let inode_i = inode.inode_i;
-        let mut handle =
-            self.get_file_handle(inode, OPEN_MODE_BINARY | OPEN_MODE_READ | OPEN_MODE_WRITE)?;
+        let mut handle = self.get_file_handle(inode, OPEN_MODE_READ | OPEN_MODE_WRITE)?;
         // deallocate all the blocks
         handle.truncate(self, 0)?;
         handle.flush(self)?;
@@ -542,11 +535,7 @@ impl Ext2Volume {
         self.update_inode(&inode)?;
 
         let inode = self.get_inode(dir_inode, Some(dir_inode))?;
-        let mut iterator = DirectoryIterator::new(
-            self,
-            inode,
-            OPEN_MODE_BINARY | OPEN_MODE_READ | OPEN_MODE_WRITE,
-        )?;
+        let mut iterator = DirectoryIterator::new(self, inode, OPEN_MODE_READ | OPEN_MODE_WRITE)?;
         let name = name.iter().map(|c| *c as u8).collect::<Vec<u8>>();
 
         iterator.insert_entry(inode_i, &name, entry_type)?;
@@ -567,11 +556,7 @@ impl Ext2Volume {
         }
         self.update_inode(&inode)?;
 
-        let mut iterator = DirectoryIterator::new(
-            self,
-            inode,
-            OPEN_MODE_BINARY | OPEN_MODE_READ | OPEN_MODE_WRITE,
-        )?;
+        let mut iterator = DirectoryIterator::new(self, inode, OPEN_MODE_READ | OPEN_MODE_WRITE)?;
 
         let entry_self = iterator.insert_entry(inode_i, b".", DirectoryEntryType::Directory)?;
         iterator.move_to_entry(&entry_self)?;
@@ -889,7 +874,7 @@ impl Ext2Volume {
             value: Either::B(Directory::new(
                 self,
                 self.get_inode(2, None)?,
-                OPEN_MODE_BINARY | OPEN_MODE_READ,
+                OPEN_MODE_READ,
             )?),
         }));
         Ok(())

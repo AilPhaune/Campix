@@ -490,8 +490,8 @@ impl ExecutableFileFormat for Elf64File {
                     buffer.fill(0);
                     code_i += PAGE_SIZE as usize;
                 } else {
-                    let rem = filesz - code_i;
-                    buffer[0..rem].copy_from_slice(&segment_data[code_i..]);
+                    let rem = (filesz - code_i).min(PAGE_SIZE as usize);
+                    buffer[0..rem].copy_from_slice(&segment_data[code_i..(code_i + rem)]);
                     code_i += rem;
                 }
 

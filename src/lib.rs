@@ -9,7 +9,7 @@ use data::file::File;
 use drivers::{
     fs::phys::ext2::Ext2Volume,
     pci,
-    vfs::{get_vfs, OPEN_MODE_BINARY, OPEN_MODE_READ, OPEN_MODE_WRITE},
+    vfs::{get_vfs, OPEN_MODE_READ, OPEN_MODE_WRITE},
 };
 use memory::mem::OsMemoryRegion;
 use obsiboot::ObsiBootKernelParameters;
@@ -98,7 +98,7 @@ pub fn _start(obsiboot_ptr: u64) -> ! {
         {
             let file = File::open(
                 "/dev/pata_pm_p0",
-                OPEN_MODE_READ | OPEN_MODE_WRITE | OPEN_MODE_BINARY,
+                OPEN_MODE_READ | OPEN_MODE_WRITE,
                 Permissions::from_u64(0),
             )
             .unwrap();
