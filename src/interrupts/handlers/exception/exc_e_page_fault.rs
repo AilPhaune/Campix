@@ -91,7 +91,7 @@ pub fn handler(
         macro_rules! print_info1 {
             () => {
                 print_info0!();
-                println!("Running process thread: {:?}", thread);
+                println!("Running process thread: {:#?}", thread);
             };
         }
 

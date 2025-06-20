@@ -29,6 +29,24 @@ impl Debug for File {
 }
 
 impl File {
+    /// # Safety
+    /// Safe only if the handle is valid and not used elsewhere, and if other parameters correspond to that same file
+    pub unsafe fn unsafe_from_raw(
+        mode: u64,
+        path: Vec<char>,
+        fs: Arcrwb<dyn FileSystem>,
+        file: VfsFile,
+        handle: u64,
+    ) -> File {
+        File {
+            mode,
+            path,
+            fs,
+            file,
+            handle,
+        }
+    }
+
     // TODO: Add create_perms on FileSystem interface
     pub fn open(path: &str, mode: u64, _create_perms: Permissions) -> Result<File, VfsError> {
         let path = path.chars().collect::<Vec<char>>();
@@ -314,10 +332,11 @@ impl Drop for File {
 #[derive(Debug)]
 pub struct Directory {
     path: String,
+    vfsfile: VfsFile,
 }
 
 impl Directory {
-    pub fn of(path: &[char]) -> Self {
+    pub fn of(path: &[char], vfsfile: VfsFile) -> Self {
         let mut value = path.to_vec();
         while let Some(c) = value.last() {
             if *c == '/' {
@@ -328,11 +347,16 @@ impl Directory {
         }
         Self {
             path: value.iter().collect::<String>(),
+            vfsfile,
         }
     }
 
     pub fn list(&self) -> Result<Vec<DirectoryEntry>, VfsError> {
         File::list_directory(&self.path)
+    }
+
+    pub fn get_vfs_file(&self) -> &VfsFile {
+        &self.vfsfile
     }
 }
 
@@ -367,7 +391,7 @@ impl DirectoryEntry {
     pub fn get_dir(&self) -> Result<Directory, VfsError> {
         match self.entry.kind() {
             VfsFileKind::Directory | VfsFileKind::MountPoint { .. } => {
-                Ok(Directory::of(self.full_name()))
+                Ok(Directory::of(self.full_name(), self.entry.clone()))
             }
             _ => Err(VfsError::NotDirectory),
         }

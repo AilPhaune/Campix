@@ -10,7 +10,10 @@ use alloc::{
 };
 use spin::RwLock;
 
-use crate::data::either::Either;
+use crate::{
+    data::either::Either,
+    drivers::fs::virt::pipefs::{init_pipefs, Pipe},
+};
 
 use super::fs::virt::devfs::init_devfs;
 
@@ -60,16 +63,35 @@ pub enum VfsError {
     NameTooLong,
     ShortRead,
     Done,
+    WouldBlock,
+    BrokenPipe,
     DriverError(Box<dyn core::fmt::Debug>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipeMode {
+    Read,
+    Write,
 }
 
 #[derive(Clone)]
 pub enum VfsFileKind {
     File,
     Directory,
-    BlockDevice { device: Arcrwb<dyn BlockDevice> },
-    CharacterDevice { device: Arcrwb<dyn CharacterDevice> },
-    MountPoint { mounted_fs: Arcrwb<dyn FileSystem> },
+    BlockDevice {
+        device: Arcrwb<dyn BlockDevice>,
+    },
+    CharacterDevice {
+        device: Arcrwb<dyn CharacterDevice>,
+    },
+    MountPoint {
+        mounted_fs: Arcrwb<dyn FileSystem>,
+    },
+    Pipe {
+        pipe: Arcrwb<Pipe>,
+        mode: PipeMode,
+        pipe_id: u64,
+    },
 }
 
 impl Debug for VfsFileKind {
@@ -80,6 +102,7 @@ impl Debug for VfsFileKind {
             VfsFileKind::BlockDevice { .. } => write!(f, "BlockDevice"),
             VfsFileKind::CharacterDevice { .. } => write!(f, "CharacterDevice"),
             VfsFileKind::MountPoint { .. } => write!(f, "MountPoint"),
+            VfsFileKind::Pipe { .. } => write!(f, "Pipe"),
         }
     }
 }
@@ -114,6 +137,17 @@ impl VfsFile {
     pub fn get_char_device(&self) -> Option<Arcrwb<dyn CharacterDevice>> {
         match &self.kind {
             VfsFileKind::CharacterDevice { device } => Some(device.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn get_pipe(&self) -> Option<(Arcrwb<Pipe>, PipeMode, u64)> {
+        match &self.kind {
+            VfsFileKind::Pipe {
+                pipe,
+                mode,
+                pipe_id,
+            } => Some((pipe.clone(), *mode, *pipe_id)),
             _ => None,
         }
     }
@@ -1182,7 +1216,7 @@ impl FileHandleAllocator {
         Some(&mut (*handle_data).data as *mut T)
     }
 
-    pub fn dealloc_file_handle<T: Sized + Clone + Debug>(&mut self, handle: u64) {
+    pub fn dealloc_file_handle<T: Sized + Clone + Debug>(&mut self, handle: u64) -> bool {
         if self.handles.contains(&handle) {
             unsafe {
                 dealloc(
@@ -1191,11 +1225,18 @@ impl FileHandleAllocator {
                 )
             };
             self.handles.remove(&handle);
+            true
+        } else {
+            false
         }
     }
 
     pub fn iter(&self) -> btree_set::Iter<u64> {
         self.handles.iter()
+    }
+
+    pub fn count(&self) -> usize {
+        self.handles.len()
     }
 }
 
@@ -1230,4 +1271,5 @@ pub fn get_vfs() -> Arcrwb<Vfs> {
 
 fn init_vfs(vfs: &mut Vfs) {
     init_devfs(vfs);
+    init_pipefs(vfs);
 }

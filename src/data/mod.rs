@@ -35,3 +35,15 @@ pub fn calloc_boxed_slice<T: Default>(count: usize) -> Box<[T]> {
     }
     slice
 }
+
+pub fn decimal_chars_to_u64(chars: &[char]) -> Option<u64> {
+    let mut result: u64 = 0;
+    for &c in chars {
+        if let Some(digit) = c.to_digit(10) {
+            result = result.checked_mul(10)?.checked_add(digit as u64)?;
+        } else {
+            return None; // Not a digit
+        }
+    }
+    Some(result)
+}

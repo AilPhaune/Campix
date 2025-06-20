@@ -31,6 +31,7 @@ pub const EISDIR: u64 = 21;
 pub const EINVAL: u64 = 22;
 pub const EMFILE: u64 = 24;
 pub const ESPIPE: u64 = 29;
+pub const EPIPE: u64 = 32;
 pub const ENOSYS: u64 = 38;
 pub const ENOTEMPTY: u64 = 39;
 
@@ -132,6 +133,7 @@ pub fn vfs_err_to_linux_errno(err: VfsError) -> u64 {
         VfsError::DirectoryNotEmpty => ENOTEMPTY,
         VfsError::NotDirectory => ENOTDIR,
         VfsError::NotFile => EISDIR,
+        VfsError::BrokenPipe => ESPIPE,
         _ => EIO,
     }
 }
