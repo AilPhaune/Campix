@@ -5,8 +5,8 @@ use crate::{
     interrupts::{
         handlers::syscall::linux::{
             io::{
-                linux_sys_close, linux_sys_lseek, linux_sys_mkdir, linux_sys_open, linux_sys_read,
-                linux_sys_write,
+                linux_sys_close, linux_sys_lseek, linux_sys_mkdir, linux_sys_open, linux_sys_pipe,
+                linux_sys_read, linux_sys_write,
             },
             kernel_info::linux_sys_uname,
             processes::linux_sys_sched_yield,
@@ -25,15 +25,20 @@ pub const EPERM: u64 = 1;
 pub const ENOENT: u64 = 2;
 pub const EIO: u64 = 5;
 pub const EBADF: u64 = 9;
+pub const EWOULDBLOCK: u64 = 11;
 pub const EEXIST: u64 = 17;
 pub const ENOTDIR: u64 = 20;
 pub const EISDIR: u64 = 21;
 pub const EINVAL: u64 = 22;
 pub const EMFILE: u64 = 24;
+pub const ENOSPC: u64 = 28;
 pub const ESPIPE: u64 = 29;
+pub const EROFS: u64 = 30;
 pub const EPIPE: u64 = 32;
 pub const ENOSYS: u64 = 38;
 pub const ENOTEMPTY: u64 = 39;
+pub const ENODATA: u64 = 61;
+pub const ENOTSUP: u64 = 95;
 
 pub const SIGKILL: u64 = 9;
 
@@ -79,6 +84,7 @@ fn linux_syscall0(
         2 => linux_sys_open(thread, arg0, arg1, arg2),
         3 => linux_sys_close(thread, arg0),
         8 => linux_sys_lseek(thread, arg0, arg1, arg2),
+        22 => linux_sys_pipe(thread, arg0),
         24 => linux_sys_sched_yield(thread),
         60 => linux_sys_exit(thread.tid, arg0),
         63 => linux_sys_uname(thread, arg0),
@@ -134,6 +140,20 @@ pub fn vfs_err_to_linux_errno(err: VfsError) -> u64 {
         VfsError::NotDirectory => ENOTDIR,
         VfsError::NotFile => EISDIR,
         VfsError::BrokenPipe => ESPIPE,
-        _ => EIO,
+        VfsError::WouldBlock => EWOULDBLOCK,
+        VfsError::AlreadyMounted => EEXIST,
+        VfsError::NameTooLong => EINVAL,
+        VfsError::FileSystemMismatch => EINVAL,
+        VfsError::FileSystemNotMounted => ENOENT,
+        VfsError::ReadOnly => EROFS,
+        VfsError::OutOfSpace => ENOSPC,
+        VfsError::MaximumSizeReached => EINVAL,
+        VfsError::InvalidDataStructure => EINVAL,
+        VfsError::NotMountPoint => EINVAL,
+        VfsError::OutOfBounds => EINVAL,
+        VfsError::ShortRead => EINVAL,
+        VfsError::UnknownError => EIO,
+        VfsError::Done => ENODATA,
+        VfsError::DriverError(..) => EIO,
     }
 }

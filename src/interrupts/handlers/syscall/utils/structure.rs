@@ -8,11 +8,14 @@ pub struct UserProcessStructure<T: Sized> {
 }
 
 impl<T: Sized> UserProcessStructure<T> {
-    pub fn new(data: *mut T) -> Self {
-        Self {
+    pub fn new(data: *mut T) -> Option<Self> {
+        if !data.is_aligned() {
+            return None;
+        }
+        Some(Self {
             buffer: UserProcessBuffer::new(data as *mut u8, size_of::<T>()),
             phantom: PhantomData,
-        }
+        })
     }
 
     pub fn verify_fully_mapped(&self, page_table: &mut PageTable) -> Option<&T> {

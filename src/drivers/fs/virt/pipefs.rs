@@ -30,24 +30,9 @@ pub struct Pipe {
     pub closed: bool,
 }
 
-impl Pipe {
-    pub fn new_anonymous(buf_size: usize) -> Pipe {
-        Pipe {
-            data: calloc_boxed_slice(buf_size),
-            data_len: 0,
-            write_pos: 0,
-            read_pos: 0,
-            created_at: 0,
-            modified_at: 0,
-            readers: 0,
-            writers: 0,
-            closed: false,
-        }
-    }
-
-    pub fn create() -> Result<(u64, File, File), VfsError> {
-        let pipe_dir = File::mkdir0("/pipes/a".chars().collect::<Vec<char>>())?;
-        let pipe_vfs_file = pipe_dir.get_vfs_file();
+macro_rules! impl_pipe_create {
+    ($pipe_dir: ident) => {{
+        let pipe_vfs_file = $pipe_dir.get_vfs_file();
 
         let vfs = get_vfs();
         let guard = vfs.write();
@@ -72,8 +57,40 @@ impl Pipe {
         let w = pipefs_guard.fopen(&wfile, OPEN_MODE_WRITE)?;
 
         drop(guard);
+        drop(pipefs_guard);
 
+        (rid, r, w, pipe_vfs_file, pipefs, rfile, wfile)
+    }};
+}
+
+impl Pipe {
+    pub fn new_anonymous(buf_size: usize) -> Pipe {
+        Pipe {
+            data: calloc_boxed_slice(buf_size),
+            data_len: 0,
+            write_pos: 0,
+            read_pos: 0,
+            created_at: 0,
+            modified_at: 0,
+            readers: 0,
+            writers: 0,
+            closed: false,
+        }
+    }
+
+    /// # Safety
+    /// Caller is responsible for what they do with the handles
+    pub unsafe fn create_raw_fds() -> Result<(u64, u64, u64, Arcrwb<dyn FileSystem>), VfsError> {
+        let pipe_dir = File::mkdir0("/pipes/a".chars().collect::<Vec<char>>())?;
+        let (rid, r, w, _, pipe_fs, _, _) = impl_pipe_create!(pipe_dir);
+        Ok((rid, r, w, pipe_fs))
+    }
+
+    pub fn create() -> Result<(u64, File, File), VfsError> {
         unsafe {
+            let pipe_dir = File::mkdir0("/pipes/a".chars().collect::<Vec<char>>())?;
+            let (rid, r, w, pipe_vfs_file, pipefs, rfile, wfile) = impl_pipe_create!(pipe_dir);
+
             let reader = File::unsafe_from_raw(
                 OPEN_MODE_READ,
                 [pipe_vfs_file.name(), &['/', 'r']].concat(),

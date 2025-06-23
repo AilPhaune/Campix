@@ -1,18 +1,21 @@
-use alloc::vec::Vec;
+use ::alloc::vec::Vec;
 
 use crate::{
     data::{file::File, permissions::Permissions},
     debuggable_bitset_enum,
-    drivers::vfs::{
-        FileStat, SeekPosition, VfsFileKind, OPEN_MODE_APPEND, OPEN_MODE_CREATE,
-        OPEN_MODE_FAIL_IF_EXISTS, OPEN_MODE_READ, OPEN_MODE_WRITE,
+    drivers::{
+        fs::virt::pipefs::Pipe,
+        vfs::{
+            FileStat, SeekPosition, VfsFileKind, OPEN_MODE_APPEND, OPEN_MODE_CREATE,
+            OPEN_MODE_FAIL_IF_EXISTS, OPEN_MODE_READ, OPEN_MODE_WRITE,
+        },
     },
     interrupts::handlers::syscall::{
         linux::{
             vfs_err_to_linux_errno, EBADF, EINVAL, EMFILE, ENOENT, ENOTDIR, EPERM, WHENCE_CUR,
             WHENCE_END, WHENCE_SET,
         },
-        utils::buffer::UserProcessBuffer,
+        utils::{buffer::UserProcessBuffer, structure::UserProcessStructure},
     },
     linux_return_err_from_syscall,
     paging::PageTable,
@@ -208,6 +211,55 @@ pub fn linux_sys_open(thread: &ProcThreadInfo, path: u64, flags: u64, mode: u64)
         Some((idx, f)) => {
             *f = Some((fs, handle));
             idx as u64
+        }
+        None => linux_return_err_from_syscall!(EMFILE),
+    }
+}
+
+#[repr(C, packed(8))]
+struct LinuxPipefds {
+    read: u64,
+    write: u64,
+}
+
+pub fn linux_sys_pipe(thread: &ProcThreadInfo, fds: u64) -> u64 {
+    let mut pt = PageTable::temporary_this();
+
+    let Some(mut structure) = UserProcessStructure::new(fds as *mut LinuxPipefds) else {
+        linux_return_err_from_syscall!(EINVAL)
+    };
+
+    let Some(fds) = structure.verify_fully_mapped_mut(&mut pt) else {
+        linux_return_err_from_syscall!(EINVAL)
+    };
+
+    let mut io_ctx = thread.thread.process.io_context.lock();
+    match io_ctx.file_table.alloc_fds(2) {
+        Some(alloc_fds) => {
+            if alloc_fds.len() != 2 {
+                linux_return_err_from_syscall!(EINVAL)
+            }
+            let (read, write) = (alloc_fds[0], alloc_fds[1]);
+
+            let (_, pipe_read, pipe_write, pipe_fs) = match unsafe { Pipe::create_raw_fds() } {
+                Ok(p) => p,
+                Err(e) => linux_return_err_from_syscall!(vfs_err_to_linux_errno(e)),
+            };
+
+            let Some(readfd) = io_ctx.file_table.get_fd(read) else {
+                linux_return_err_from_syscall!(EINVAL)
+            };
+            *readfd = Some((pipe_fs.clone(), pipe_read));
+
+            let Some(writefs) = io_ctx.file_table.get_fd(write) else {
+                linux_return_err_from_syscall!(EINVAL)
+            };
+            *writefs = Some((pipe_fs, pipe_write));
+
+            fds.read = read as u64;
+            fds.write = write as u64;
+
+            0
         }
         None => linux_return_err_from_syscall!(EMFILE),
     }

@@ -16,10 +16,7 @@ use obsiboot::ObsiBootKernelParameters;
 use paging::{init_paging, physical_to_virtual};
 use process::{executable::parse_executable, scheduler::SCHEDULER};
 
-use crate::{
-    data::permissions::Permissions,
-    drivers::{fs::virt::pipefs::Pipe, vfs::VfsError},
-};
+use crate::data::permissions::Permissions;
 
 extern crate alloc;
 
@@ -81,7 +78,7 @@ pub fn _start(obsiboot_ptr: u64) -> ! {
         percpu::init_per_cpu(0);
         println!("Per-CPU initialized");
 
-        //interrupts::init();
+        interrupts::init();
         println!("Interrupts initialized");
 
         syscalls::init();
@@ -119,54 +116,6 @@ pub fn _start(obsiboot_ptr: u64) -> ! {
                 .mount(&"system".chars().collect::<Vec<char>>(), Box::new(ext2))
                 .unwrap();
             drop(wguard);
-        }
-
-        {
-            let (id, read, mut write) = Pipe::create().unwrap();
-
-            println!("Pipe created with id {}", id);
-
-            // Generate 10 MB of data
-            const SIZE: usize = 10 * 1024 * 1024;
-            let mut lfsr: u32 = 0xACE7AB41; // Seed
-            let mut data = Vec::with_capacity(SIZE);
-            for _ in 0..SIZE {
-                let bit = (lfsr ^ (lfsr >> 2) ^ (lfsr >> 3) ^ (lfsr >> 5)) & 1;
-                lfsr = (lfsr >> 1) | (bit << 15);
-                data.push((lfsr & 0xFF) as u8);
-            }
-
-            let mut read_back = alloc::vec![0u8; SIZE];
-
-            let mut written = 0;
-            let mut read_total = 0;
-
-            // Write loop
-            while written < SIZE {
-                let n = match write.write(&data[written..]) {
-                    Ok(n) => n as usize,
-                    Err(VfsError::WouldBlock) => 0,
-                    #[allow(clippy::unnecessary_literal_unwrap)]
-                    Err(e) => Err(e).unwrap(),
-                };
-
-                if n == 0 {
-                    // Pipe full, try to drain it a bit
-                    let r = read.read(&mut read_back[read_total..]).unwrap();
-                    read_total += r as usize;
-                } else {
-                    written += n;
-                }
-            }
-
-            // Ensure everything left in pipe is read
-            while read_total < SIZE {
-                let r = read.read(&mut read_back[read_total..]).unwrap();
-                read_total += r as usize;
-            }
-
-            assert_eq!(data, read_back);
-            println!("Successfully wrote and read back 10 MB through the pipe.");
         }
 
         kmain(obsiboot);

@@ -7,7 +7,7 @@ use crate::drivers::vfs::{Arcrwb, FileSystem};
 pub const MAX_FILES: usize = 4096;
 
 pub struct FileTable {
-    pub files: Vec<Option<(Arcrwb<dyn FileSystem>, u64)>>,
+    pub files: Vec<OptionalFd>,
     pub max_allocated_fd: usize,
     pub available_fds: Vec<usize>,
 }
@@ -17,6 +17,10 @@ impl Default for FileTable {
         Self::new()
     }
 }
+
+type Fd = (Arcrwb<dyn FileSystem>, u64);
+type OptionalFd = Option<Fd>;
+type AllocatedFdMutableRef<'a> = (usize, &'a mut OptionalFd);
 
 impl FileTable {
     pub fn new() -> Self {
@@ -35,8 +39,7 @@ impl FileTable {
         self
     }
 
-    #[allow(clippy::type_complexity)]
-    pub fn alloc_fd(&mut self) -> Option<(usize, &mut Option<(Arcrwb<dyn FileSystem>, u64)>)> {
+    pub fn alloc_fd(&mut self) -> Option<AllocatedFdMutableRef<'_>> {
         if let Some(fd) = self.available_fds.pop() {
             Some((fd, &mut self.files[fd]))
         } else if self.max_allocated_fd < MAX_FILES {
@@ -48,7 +51,22 @@ impl FileTable {
         }
     }
 
-    pub fn free_fd(&mut self, idx: usize) -> Option<(Arcrwb<dyn FileSystem>, u64)> {
+    pub fn alloc_fds(&mut self, count: usize) -> Option<Vec<usize>> {
+        let mut fds = Vec::with_capacity(count);
+        for _ in 0..count {
+            if let Some(fd) = self.alloc_fd() {
+                fds.push(fd.0);
+            } else {
+                for idx in fds {
+                    self.free_fd(idx);
+                }
+                return None;
+            }
+        }
+        Some(fds)
+    }
+
+    pub fn free_fd(&mut self, idx: usize) -> OptionalFd {
         if idx >= self.files.len() {
             return None;
         }
@@ -56,7 +74,7 @@ impl FileTable {
         self.files[idx].take()
     }
 
-    pub fn get_fd(&mut self, idx: usize) -> Option<&mut Option<(Arcrwb<dyn FileSystem>, u64)>> {
+    pub fn get_fd(&mut self, idx: usize) -> Option<&mut OptionalFd> {
         self.files.get_mut(idx)
     }
 }

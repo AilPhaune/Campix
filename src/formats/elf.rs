@@ -533,7 +533,7 @@ impl ExecutableFileFormat for Elf64File {
                 },
                 rip: self.header.entry_offset,
                 rbp: PROC_USER_STACK_TOP,
-                rsp: PROC_USER_STACK_TOP,
+                rsp: PROC_USER_STACK_TOP - 8,
                 rflags: RFlags::empty()
                     .set(RFlag::InterruptFlag)
                     .set(RFlag::IOPL3)

@@ -27,7 +27,9 @@ macro_rules! populate_cstr {
 
 pub fn linux_sys_uname(thread: &ProcThreadInfo, buf: u64) -> u64 {
     let mut ptlock = thread.thread.process.page_table.lock();
-    let mut user_struct = UserProcessStructure::new(buf as *mut LinuxUtsname);
+    let Some(mut user_struct) = UserProcessStructure::new(buf as *mut LinuxUtsname) else {
+        linux_return_err_from_syscall!(EINVAL)
+    };
     match user_struct.verify_fully_mapped_mut(&mut ptlock) {
         Some(utsname) => {
             if !populate_cstr!(b"Campix", utsname.sysname)

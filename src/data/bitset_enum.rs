@@ -32,7 +32,7 @@ macro_rules! debuggable_bitset_enum {
                                 Some(unsafe { core::mem::transmute::<$t, $name>(masked) })
                             }
                         })
-                        .collect::<alloc::vec::Vec<_>>()
+                        .collect::<$crate::alloc::vec::Vec<_>>()
                 )
             }
         }
