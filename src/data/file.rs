@@ -241,6 +241,10 @@ impl File {
         self.handle
     }
 
+    pub fn get_file_system(&self) -> Arcrwb<dyn FileSystem> {
+        self.fs.clone()
+    }
+
     /// Writes the buffer to the file at the current position, incrementing the position by the amount of bytes written, and returns the number of bytes written
     pub fn write(&mut self, buf: &[u8]) -> Result<u64, VfsError> {
         let mut guard = self.fs.write();

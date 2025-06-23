@@ -86,6 +86,7 @@ impl Pipe {
         Ok((rid, r, w, pipe_fs))
     }
 
+    /// Returns (pipe id, read file, write file)
     pub fn create() -> Result<(u64, File, File), VfsError> {
         unsafe {
             let pipe_dir = File::mkdir0("/pipes/a".chars().collect::<Vec<char>>())?;

@@ -204,6 +204,20 @@ unsafe fn kmain(obsiboot: ObsiBootKernelParameters) -> ! {
         }
     };
 
-    SCHEDULER.create_process(options);
+    SCHEDULER
+        .create_process(
+            options,
+            File::open("/dev/null", OPEN_MODE_READ, Permissions::from_u64(0)).unwrap(),
+            Some((
+                File::open("/dev/null", OPEN_MODE_READ, Permissions::from_u64(0)).unwrap(),
+                File::open("/dev/null", OPEN_MODE_READ, Permissions::from_u64(0)).unwrap(),
+            )),
+            Some((
+                File::open("/dev/null", OPEN_MODE_READ, Permissions::from_u64(0)).unwrap(),
+                File::open("/dev/null", OPEN_MODE_READ, Permissions::from_u64(0)).unwrap(),
+            )),
+        )
+        .unwrap();
+
     SCHEDULER.schedule();
 }

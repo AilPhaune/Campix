@@ -7,6 +7,8 @@ use alloc::{
 use spin::{mutex::Mutex, RwLock};
 
 use crate::{
+    data::file::File,
+    drivers::{fs::virt::pipefs::Pipe, vfs::VfsError},
     interrupts::handlers::syscall::linux::SIGKILL,
     paging::{get_kernel_page_table, PageTable, PAGE_ACCESSED, PAGE_PRESENT, PAGE_RW, PAGE_USER},
     percpu::{core_id, get_per_cpu, InterruptSource},
@@ -97,10 +99,31 @@ impl Scheduler {
         }
     }
 
-    pub fn create_process(&self, options: CreateProcessOptions) -> u32 {
+    pub fn create_process(
+        &self,
+        options: CreateProcessOptions,
+        stdin: File,
+        stdout_override: Option<(File, File)>,
+        stderr_override: Option<(File, File)>,
+    ) -> Result<(u32, File, File), VfsError> {
         let pid = self.get_next_pid();
 
         let pml4 = options.page_table.get_pml4();
+
+        let stdout = match stdout_override {
+            Some(pipe) => pipe,
+            None => {
+                let pipe = Pipe::create()?;
+                (pipe.1, pipe.2)
+            }
+        };
+        let stderr = match stderr_override {
+            Some(pipe) => pipe,
+            None => {
+                let pipe = Pipe::create()?;
+                (pipe.1, pipe.2)
+            }
+        };
 
         let process = Arc::new(Process {
             name: options.name.clone(),
@@ -122,7 +145,7 @@ impl Scheduler {
             threads: Mutex::new(Vec::new()),
             zombie_threads: Mutex::new(Vec::new()),
             state: Mutex::new(TaskState::Init),
-            io_context: Mutex::new(ProcessIOContext::new()),
+            io_context: Mutex::new(ProcessIOContext::new_with_stdio(stdin, stdout.1, stderr.1)),
         });
 
         let mut pt = process.page_table.lock();
@@ -166,7 +189,7 @@ impl Scheduler {
         self.threads.write().insert(pid, proct.clone());
         self.task_queue.lock().push_back(proct);
 
-        pid
+        Ok((pid, stdout.0, stderr.0))
     }
 
     pub fn get_thread_settings(&self) -> SchedulerThreadSettings {
