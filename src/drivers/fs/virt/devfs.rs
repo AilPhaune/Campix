@@ -10,14 +10,11 @@ use alloc::{
 use spin::RwLock;
 
 use crate::drivers::{
-    disk::init_disk_drivers,
-    fs::virt::files::init_vfiles,
     pci::{self, PciDevice},
     vfs::{
         Arcrwb, AsAny, BlockDevice, FileHandleAllocator, FileStat, FileSystem, PathTraverse,
         SeekPosition, Vfs, VfsError, VfsFile, VfsFileKind, VfsSpecificFileData, WeakArcrwb,
     },
-    vga::init_vga,
 };
 
 pub const fn fseek_helper(seek: SeekPosition, current_position: u64, len: u64) -> Option<u64> {
@@ -572,7 +569,6 @@ pub fn init_devfs(vfs: &mut Vfs) {
     let devfs = &mut **wguard;
     let devfs = devfs.as_any_mut().downcast_mut::<DevFs>().unwrap();
 
-    init_disk_drivers(devfs);
-    init_vga(devfs);
-    init_vfiles(devfs);
+    crate::drivers::init_vfiles(devfs);
+    crate::drivers::fs::virt::files::init_vfiles(devfs);
 }

@@ -172,7 +172,10 @@ impl KernelGdt {
     }
 }
 
-pub static GDT: KernelGdt = KernelGdt(
+#[repr(align(16))]
+pub struct AlignedGdt(pub KernelGdt);
+
+pub static GDT: AlignedGdt = AlignedGdt(KernelGdt(
     [
         GdtEntry::new(0, 0, 0, 0), // Null descriptor
         /*
@@ -243,30 +246,36 @@ pub static GDT: KernelGdt = KernelGdt(
         ), // 32-bit Data
     ],
     TssEntry::new(0, 0),
-);
+));
 
 pub const KERNEL_CODE_SELECTOR: usize = GDT
+    .0
     .get_code_selector(GdtRing::Ring0, GdtBits::Bits64)
     .unwrap();
 pub const KERNEL_DATA_SELECTOR: usize = GDT
+    .0
     .get_data_selector(GdtRing::Ring0, GdtBits::Bits64)
     .unwrap();
 
 pub const USERLAND_DATA32_SELECTOR: usize = GDT
+    .0
     .get_data_selector(GdtRing::Ring3, GdtBits::Bits32)
     .unwrap();
 pub const USERLAND_CODE32_SELECTOR: usize = GDT
+    .0
     .get_code_selector(GdtRing::Ring3, GdtBits::Bits32)
     .unwrap();
 
 pub const USERLAND_DATA64_SELECTOR: usize = GDT
+    .0
     .get_data_selector(GdtRing::Ring3, GdtBits::Bits64)
     .unwrap();
 pub const USERLAND_CODE64_SELECTOR: usize = GDT
+    .0
     .get_code_selector(GdtRing::Ring3, GdtBits::Bits64)
     .unwrap();
 
-pub const TSS_SELECTOR: usize = GDT.0.len() * size_of::<GdtEntry>();
+pub const TSS_SELECTOR: usize = GDT.0 .0.len() * size_of::<GdtEntry>();
 
 #[no_mangle]
 pub static mut GDTR: GdtDescriptor = GdtDescriptor { limit: 0, base: 0 };
@@ -280,14 +289,14 @@ pub(crate) unsafe fn init_gdtr() {
 
     unsafe {
         core::ptr::write_volatile(
-            addr_of!(GDT.1) as *mut TssEntry,
+            addr_of!(GDT.0 .1) as *mut TssEntry,
             TssEntry::new(get_tss_addr(), size_of::<RawTaskStateSegment>() as u32 - 1),
         );
     }
 
-    println!("Kernel GDT at {:#016x}", GDT.0.as_ptr() as u64);
-    for i in 0..GDT.0.len() {
-        println!("  Descriptor #{}: {:016x}", i, GDT.0[i].into());
+    println!("Kernel GDT at {:#016x}", GDT.0 .0.as_ptr() as u64);
+    for i in 0..GDT.0 .0.len() {
+        println!("  Descriptor #{}: {:016x}", i, GDT.0 .0[i].into());
     }
     println!("GDTR at {:#016x}", addr_of!(GDTR) as u64);
 
@@ -301,7 +310,7 @@ pub(crate) unsafe fn init_gdtr() {
 
     println!("Kernel TSS at {:#016x}", get_tss_addr());
     println!("TSS entry: {:#032x}", unsafe {
-        *(&GDT.1 as *const TssEntry as *const u128)
+        core::ptr::read_unaligned(&GDT.0 .1 as *const TssEntry as *const u128)
     });
 
     println!();

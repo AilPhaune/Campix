@@ -15,9 +15,6 @@ impl GlobalAlloc {
 
 unsafe impl core::alloc::GlobalAlloc for GlobalAlloc {
     unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
-        if layout.size() == 0 {
-            return core::ptr::null_mut();
-        }
         if layout.align() > 4096 {
             return core::ptr::null_mut();
         }
@@ -28,7 +25,7 @@ unsafe impl core::alloc::GlobalAlloc for GlobalAlloc {
                 layout
             ),
             Some(allocator) => allocator
-                .alloc(layout.size() as u64)
+                .alloc(layout.size().max(1) as u64)
                 .map(|addr| addr as *mut u8)
                 .unwrap_or(core::ptr::null_mut()),
         }
