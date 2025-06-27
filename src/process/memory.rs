@@ -144,13 +144,28 @@ impl ThreadStack {
         stack
     }
 
+    pub fn build(stack_top: u64, data: &[u8], table: &mut PageTable, flags: u64) -> Self {
+        let mut stack = ThreadStack::new(stack_top);
+        for chunk in data.chunks(PAGE_SIZE) {
+            let reverse = chunk.iter().rev().copied().collect::<Vec<u8>>();
+            if reverse.len() == PAGE_SIZE {
+                stack.grow_using_existing_buffer(table, flags, reverse.into_boxed_slice());
+            } else {
+                let mut buffer = calloc_boxed_slice::<u8>(PAGE_SIZE);
+                buffer[PAGE_SIZE - reverse.len()..].copy_from_slice(&reverse);
+                stack.grow_using_existing_buffer(table, flags, buffer);
+            }
+        }
+        stack
+    }
+
     pub fn get_bottom(&self) -> u64 {
         self.stack_top - self.stack_size
     }
 
-    pub fn grow(&mut self, table: &mut PageTable, flags: u64) {
+    pub fn grow(&mut self, table: &mut PageTable, flags: u64) -> bool {
         let new_buffer = calloc_boxed_slice::<u8>(PAGE_SIZE);
-        self.grow_using_existing_buffer(table, flags, new_buffer);
+        self.grow_using_existing_buffer(table, flags, new_buffer)
     }
 
     pub fn grow_using_existing_buffer(

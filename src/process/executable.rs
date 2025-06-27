@@ -10,15 +10,20 @@ use crate::{
 
 use super::scheduler::CreateProcessOptions;
 
+pub struct ExecutableInstantiateOptions {
+    pub name: String,
+    pub cmdline: Vec<String>,
+    pub cwd: String,
+    pub environment: Vec<String>,
+    pub uid: u32,
+    pub gid: u32,
+    pub supplementary_gids: Vec<u32>,
+}
+
 pub trait ExecutableFileFormat: AsAny + Debug {
     fn create_process(
         &self,
-        name: String,
-        cmdline: String,
-        cwd: String,
-        uid: u32,
-        gid: u32,
-        supplementary_gids: Vec<u32>,
+        options: ExecutableInstantiateOptions,
     ) -> Result<CreateProcessOptions, Box<dyn Debug>>;
 }
 

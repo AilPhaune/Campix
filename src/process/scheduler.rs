@@ -10,13 +10,13 @@ use crate::{
     data::file::File,
     drivers::{fs::virt::pipefs::Pipe, vfs::VfsError},
     interrupts::handlers::syscall::linux::SIGKILL,
-    paging::{get_kernel_page_table, PageTable, PAGE_ACCESSED, PAGE_PRESENT, PAGE_RW, PAGE_USER},
+    paging::{get_kernel_page_table, PageTable, PAGE_ACCESSED, PAGE_PRESENT, PAGE_RW},
     percpu::{core_id, get_per_cpu, InterruptSource},
     process::{io::context::ProcessIOContext, ui::context::UiContext},
 };
 
 use super::{
-    memory::{ProcessHeap, ThreadStack, PROC_KERNEL_STACK_TOP, PROC_USER_STACK_TOP},
+    memory::{ProcessHeap, ThreadStack, PROC_KERNEL_STACK_TOP},
     proc::{Process, ProcessAccess, ProcessAllocatedCode, TaskState, Thread, ThreadState},
 };
 
@@ -161,12 +161,7 @@ impl Scheduler {
                 &mut pt,
                 PAGE_PRESENT | PAGE_RW | PAGE_ACCESSED,
             )),
-            stack: Mutex::new(ThreadStack::new_with_pages(
-                PROC_USER_STACK_TOP,
-                1,
-                &mut pt,
-                PAGE_PRESENT | PAGE_RW | PAGE_ACCESSED | PAGE_USER,
-            )),
+            stack: Mutex::new(options.main_thread_stack),
             state: Mutex::new(options.main_thread_state),
             running_cpu: Mutex::new(None),
             task_state: Mutex::new(TaskState::Init),
@@ -431,7 +426,7 @@ pub enum ProcessSyscallABI {
 #[derive(Debug)]
 pub struct CreateProcessOptions {
     pub name: String,
-    pub cmdline: String,
+    pub cmdline: Vec<String>,
     pub cwd: String,
 
     pub uid: u32,
@@ -444,6 +439,8 @@ pub struct CreateProcessOptions {
 
     pub allocated_code: ProcessAllocatedCode,
     pub syscalls: ProcessSyscallABI,
+
+    pub main_thread_stack: ThreadStack,
 }
 
 pub static SCHEDULER: Scheduler = Scheduler::new();

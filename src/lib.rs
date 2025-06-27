@@ -26,6 +26,7 @@ use crate::{
         vfs::{self, OPEN_MODE_APPEND},
     },
     log::get_stdout,
+    process::executable::ExecutableInstantiateOptions,
 };
 
 extern crate alloc;
@@ -287,14 +288,15 @@ unsafe fn kmain(obsiboot: ObsiBootKernelParameters) -> ! {
         }
     };
 
-    let options = match executable.create_process(
-        "sysinit".to_string(),
-        "/system/sysinit".to_string(),
-        "/".to_string(),
-        0,
-        0,
-        alloc::vec![],
-    ) {
+    let options = match executable.create_process(ExecutableInstantiateOptions {
+        name: "sysinit".to_string(),
+        cmdline: alloc::vec!["/system/sysinit".to_string()],
+        cwd: "/".to_string(),
+        environment: alloc::vec![],
+        uid: 0,
+        gid: 0,
+        supplementary_gids: alloc::vec![],
+    }) {
         Ok(options) => options,
         Err(err) => {
             println!("Could not create process /system/sysinit");

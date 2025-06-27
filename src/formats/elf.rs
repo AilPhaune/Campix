@@ -4,20 +4,19 @@ use alloc::{boxed::Box, fmt, string::String, vec::Vec};
 
 use crate::{
     data::{
-        alloc_boxed_slice,
+        alloc_boxed_slice, calloc_boxed_slice,
         file::File,
         regs::rflags::{RFlag, RFlags},
     },
     debuggable_bitset_enum,
     drivers::vfs::{SeekPosition, VfsError},
-    memory::buddy_alloc::PAGE_SIZE,
     paging::{
         align_down, align_up, PageTable, DIRECT_MAPPING_OFFSET, PAGE_ACCESSED, PAGE_PRESENT,
-        PAGE_RW, PAGE_USER,
+        PAGE_RW, PAGE_SIZE, PAGE_USER,
     },
     process::{
-        executable::ExecutableFileFormat,
-        memory::PROC_USER_STACK_TOP,
+        executable::{ExecutableFileFormat, ExecutableInstantiateOptions},
+        memory::ThreadStack,
         proc::{ProcessAllocatedCode, ThreadGPRegisters, ThreadState},
         scheduler::{CreateProcessOptions, ProcessSyscallABI},
     },
@@ -434,16 +433,152 @@ impl From<ElfError> for Box<dyn Debug> {
     }
 }
 
+/// Build the stack layout as requested.
+pub fn build_stack(
+    stack_top: u64,
+    pt: &mut PageTable,
+    flags: u64,
+    args: &[String],
+    env: &[String],
+    aux: &[(u64, u64)],
+) -> (ThreadStack, u64, u64, u64) {
+    // Compute total size
+    let argc_size = size_of::<u64>();
+
+    let argv_ptrs_size = (args.len() + 1) * size_of::<u64>();
+    let envp_ptrs_size = (env.len() + 1) * size_of::<u64>();
+    let auxv_size = (aux.len() + 1) * size_of::<(u64, u64)>();
+
+    let args_data_size: usize = args.iter().map(|s| s.len() + 1).sum();
+    let env_data_size: usize = env.iter().map(|s| s.len() + 1).sum();
+
+    let total_size =
+        argc_size + argv_ptrs_size + envp_ptrs_size + auxv_size + args_data_size + env_data_size;
+
+    // Compute page count
+    let num_pages = total_size.div_ceil(PAGE_SIZE);
+
+    let mut pages: Vec<Box<[u8]>> = (0..num_pages)
+        .map(|_| calloc_boxed_slice::<u8>(PAGE_SIZE))
+        .collect();
+
+    // Compute bottom of stack memory
+    let total_alloc_size = num_pages * PAGE_SIZE;
+    let stack_bottom = stack_top as usize - total_alloc_size;
+
+    // idx: offset from stack_bottom upward
+    let mut idx = 0usize;
+
+    // argc
+    let argc = args.len() as u64;
+    write_u64(&mut pages, idx, argc);
+    idx += size_of::<u64>();
+
+    // reserve space for argv pointers
+    let argv_ptr = stack_bottom + idx;
+    idx += argv_ptrs_size;
+
+    // reserve space for envp pointers
+    let envp_ptr = stack_bottom + idx;
+    idx += envp_ptrs_size;
+
+    // reserve space for auxv
+    let auxv_ptr = stack_bottom + idx;
+    idx += auxv_size;
+
+    // write strings and store their addresses
+    let mut string_ptrs = Vec::new();
+
+    for s in args.iter().chain(env.iter()) {
+        let str_addr = stack_bottom + idx;
+        string_ptrs.push(str_addr);
+
+        let bytes = s.as_bytes();
+        for b in bytes {
+            write_byte(&mut pages, idx, *b);
+            idx += 1;
+        }
+        write_byte(&mut pages, idx, 0); // null terminator
+        idx += 1;
+    }
+
+    // split string_ptrs back into argv/envp pointers
+    let (argv_ptrs_list, envp_ptrs_list) = string_ptrs.split_at(args.len());
+
+    // fill argv pointers
+    let mut tmp_idx = argv_ptr;
+    for &addr in argv_ptrs_list {
+        write_u64(&mut pages, tmp_idx - stack_bottom, addr as u64);
+        tmp_idx += size_of::<u64>();
+    }
+    // argv null
+    write_u64(&mut pages, tmp_idx - stack_bottom, 0);
+
+    // fill envp pointers
+    tmp_idx = envp_ptr;
+    for &addr in envp_ptrs_list {
+        write_u64(&mut pages, tmp_idx - stack_bottom, addr as u64);
+        tmp_idx += size_of::<u64>();
+    }
+    // envp null
+    write_u64(&mut pages, tmp_idx - stack_bottom, 0);
+
+    // fill auxv entries
+    tmp_idx = auxv_ptr;
+    for &(key, val) in aux.iter() {
+        write_u64(&mut pages, tmp_idx - stack_bottom, key);
+        tmp_idx += size_of::<u64>();
+        write_u64(&mut pages, tmp_idx - stack_bottom, val);
+        tmp_idx += size_of::<u64>();
+    }
+    // auxv null
+    write_u64(&mut pages, tmp_idx - stack_bottom, 0);
+    tmp_idx += size_of::<u64>();
+    write_u64(&mut pages, tmp_idx - stack_bottom, 0);
+
+    assert!(idx <= total_alloc_size);
+
+    let mut stack = ThreadStack::new(stack_top);
+    for page in pages.into_iter().rev() {
+        stack.grow_using_existing_buffer(pt, flags, page);
+    }
+
+    (
+        stack,
+        (stack_bottom) as u64,
+        argv_ptr as u64,
+        envp_ptr as u64,
+    )
+}
+
+fn write_u64(pages: &mut [Box<[u8]>], offset: usize, val: u64) {
+    let bytes = val.to_le_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        write_byte(pages, offset + i, *b);
+    }
+}
+
+fn write_byte(pages: &mut [Box<[u8]>], offset: usize, byte: u8) {
+    let page_idx = offset / PAGE_SIZE;
+    let page_off = offset % PAGE_SIZE;
+    pages[page_idx][page_off] = byte;
+}
+
 impl ExecutableFileFormat for Elf64File {
     fn create_process(
         &self,
-        name: String,
-        cmdline: String,
-        cwd: String,
-        uid: u32,
-        gid: u32,
-        supplementary_gids: Vec<u32>,
+        options: ExecutableInstantiateOptions,
     ) -> Result<CreateProcessOptions, Box<dyn Debug>> {
+        let ExecutableInstantiateOptions {
+            cmdline,
+            cwd,
+            environment,
+            gid,
+            name,
+            supplementary_gids,
+            uid,
+        } = options;
+
         let mut pt = PageTable::alloc_new().ok_or(ElfError::InvalidPageTableAllocation)?;
 
         pt.map_global_higher_half();
@@ -465,32 +600,32 @@ impl ExecutableFileFormat for Elf64File {
                 .get(offset..offset + filesz)
                 .ok_or(ElfError::InvalidSegmentOffset { offset, filesz })?;
 
-            let begin_map = align_down(ph.p_vaddr, PAGE_SIZE);
-            let end_map = align_up(ph.p_vaddr + ph.p_memsz, PAGE_SIZE);
+            let begin_map = align_down(ph.p_vaddr, PAGE_SIZE as u64);
+            let end_map = align_up(ph.p_vaddr + ph.p_memsz, PAGE_SIZE as u64);
 
             let mut code_i = 0;
 
-            for virt in (begin_map..end_map).step_by(PAGE_SIZE as usize) {
-                let mut buffer = alloc_boxed_slice(PAGE_SIZE as usize);
+            for virt in (begin_map..end_map).step_by(PAGE_SIZE) {
+                let mut buffer = alloc_boxed_slice(PAGE_SIZE);
                 if virt < ph.p_vaddr {
                     let zeros = (ph.p_vaddr - virt) as usize;
-                    let rem = (PAGE_SIZE as usize - zeros).min(filesz - code_i);
+                    let rem = (PAGE_SIZE - zeros).min(filesz - code_i);
                     buffer[0..zeros].fill(0);
-                    if zeros + rem < PAGE_SIZE as usize {
+                    if zeros + rem < PAGE_SIZE {
                         buffer[zeros + rem..].fill(0);
                     }
                     buffer[zeros..zeros + rem].copy_from_slice(&segment_data[code_i..code_i + rem]);
                     code_i += rem;
-                } else if virt + PAGE_SIZE >= end_code {
+                } else if virt + PAGE_SIZE as u64 >= end_code {
                     let rem = filesz - code_i;
                     buffer[0..rem].copy_from_slice(&segment_data[code_i..]);
                     code_i += rem;
                     buffer[rem..].fill(0);
                 } else if code_i >= filesz {
                     buffer.fill(0);
-                    code_i += PAGE_SIZE as usize;
+                    code_i += PAGE_SIZE;
                 } else {
-                    let rem = (filesz - code_i).min(PAGE_SIZE as usize);
+                    let rem = (filesz - code_i).min(PAGE_SIZE);
                     buffer[0..rem].copy_from_slice(&segment_data[code_i..(code_i + rem)]);
                     code_i += rem;
                 }
@@ -506,9 +641,21 @@ impl ExecutableFileFormat for Elf64File {
             }
         }
 
+        let stack_top: u64 = 0x0000_8000_0000_0000;
+
+        let (mut s, rsp, argv, envp) = build_stack(
+            stack_top,
+            &mut pt,
+            PAGE_ACCESSED | PAGE_USER | PAGE_RW | PAGE_PRESENT,
+            &cmdline,
+            &environment,
+            &[],
+        );
+        s.grow(&mut pt, PAGE_ACCESSED | PAGE_USER | PAGE_RW | PAGE_PRESENT);
+
         Ok(CreateProcessOptions {
             name,
-            cmdline,
+            cmdline: cmdline.to_vec(),
             cwd,
             uid,
             gid,
@@ -516,12 +663,12 @@ impl ExecutableFileFormat for Elf64File {
             page_table: pt,
             main_thread_state: ThreadState {
                 gpregs: ThreadGPRegisters {
+                    rdi: cmdline.len() as u64, // arg0 = argc
+                    rsi: argv,                 // arg1 =argv
+                    rdx: envp,                 // arg2 = envp
                     rax: 0,
                     rbx: 0,
                     rcx: 0,
-                    rdx: 0,
-                    rsi: 0,
-                    rdi: 0,
                     r8: 0,
                     r9: 0,
                     r10: 0,
@@ -532,8 +679,8 @@ impl ExecutableFileFormat for Elf64File {
                     r15: 0,
                 },
                 rip: self.header.entry_offset,
-                rbp: PROC_USER_STACK_TOP,
-                rsp: PROC_USER_STACK_TOP - 8,
+                rbp: 0,
+                rsp,
                 rflags: RFlags::empty()
                     .set(RFlag::InterruptFlag)
                     .set(RFlag::IOPL3)
@@ -545,6 +692,7 @@ impl ExecutableFileFormat for Elf64File {
                 allocs: allocated_code,
             },
             syscalls: ProcessSyscallABI::Linux,
+            main_thread_stack: s,
         })
     }
 }

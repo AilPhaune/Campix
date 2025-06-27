@@ -9,11 +9,14 @@ use crate::{
                 linux_sys_read, linux_sys_write,
             },
             kernel_info::linux_sys_uname,
-            processes::linux_sys_sched_yield,
+            processes::{
+                linux_sys_arch_prctl, linux_sys_get_pid, linux_sys_get_tid, linux_sys_sched_yield,
+            },
         },
         idt::{InterruptFrameContext, InterruptFrameExtra, InterruptFrameRegisters},
     },
     percpu::get_per_cpu,
+    println,
     process::scheduler::ProcThreadInfo,
 };
 
@@ -86,10 +89,18 @@ fn linux_syscall0(
         8 => linux_sys_lseek(thread, arg0, arg1, arg2),
         22 => linux_sys_pipe(thread, arg0),
         24 => linux_sys_sched_yield(thread),
+        39 => linux_sys_get_pid(thread),
         60 => linux_sys_exit(thread.tid, arg0),
         63 => linux_sys_uname(thread, arg0),
         83 => linux_sys_mkdir(thread, arg0, arg1),
-        _ => (-(ENOSYS as i64)) as u64,
+        158 => linux_sys_arch_prctl(thread, arg0, arg1),
+        186 => linux_sys_get_tid(thread),
+        _ => {
+            if cfg!(debug_assertions) {
+                println!("Unknown syscall: {}", intno);
+            }
+            (-(ENOSYS as i64)) as u64
+        }
     }
 }
 
